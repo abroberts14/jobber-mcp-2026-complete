@@ -68,16 +68,22 @@ export async function refreshTokens(options: {
     refresh_token: options.refreshToken,
   });
 
-  // Reusing the token we sent is a GUESS, and a dangerous one: Jobber's
-  // refresh tokens are single-use, so if it did rotate and simply didn't tell
-  // us, the token we keep is already spent and the NEXT refresh fails with
-  // "The provided refresh token is not valid" — an hour later, far from the
-  // cause. Warn loudly so this shows up in logs before it bites.
+  // Refresh-token rotation is a PER-APP setting in Jobber, so this must handle
+  // both. The app this server uses has rotation DISABLED: measured against live
+  // Jobber on 2026-08-04, the response returns the same refresh_token value we
+  // sent, and JOBBER_REFRESH_TOKEN stays usable indefinitely.
+  //
+  // Do not simplify this away. On an app with rotation ENABLED the returned
+  // token differs every time and must be persisted, or the next refresh fails.
+  //
+  // The warning below is a tripwire for the one genuinely unsafe case: Jobber
+  // omitting the field entirely, where reusing the old value is a guess.
   if (!tokens.refreshToken) {
     console.error(
       '[jobber-auth] WARNING: refresh response contained no refresh_token. ' +
-        'Reusing the previous one, which will fail if Jobber rotated it ' +
-        'server-side. If refreshes start failing, re-run `npm run authorize`.'
+        'Reusing the previous one. Safe if this app has rotation disabled; if ' +
+        'rotation is enabled, the next refresh will fail — re-run ' +
+        '`npm run authorize`.'
     );
   }
 

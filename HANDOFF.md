@@ -32,10 +32,19 @@ is OAuth 2.0:
 1. Register an app at [developer.getjobber.com](https://developer.getjobber.com)
    → client ID + secret.
 2. Authorization code grant → access token + refresh token.
-3. **Access tokens expire after 60 minutes.**
-4. **Refresh tokens are single-use.** Concurrent refreshes with the same token
-   fail with `invalid_grant` — this is what the token-store lock in §3 exists
-   to prevent.
+3. **Access tokens expire after 60 minutes.** Refresh is fully automatic and
+   invisible to callers: the client renews proactively before expiry (60s skew)
+   and also refreshes-and-replays once on a 401.
+4. **Refresh-token rotation is a per-app setting, and it is DISABLED on this
+   app.** Verified against live Jobber on 2026-08-04: the refresh response
+   returns the *same* `refresh_token` value, so `JOBBER_REFRESH_TOKEN` stays
+   usable indefinitely. This corrects an earlier claim in this document that
+   the token rotated on every refresh.
+
+   `refreshTokens()` still persists a returned token when it differs, because
+   that is required on an app with rotation enabled. Do not simplify it away.
+5. **Concurrent refreshes are still not safe**, and a token can still be
+   invalidated server-side — see §3.
 
 ### Bootstrapping
 
@@ -55,15 +64,16 @@ Cosmetic, not blocking. Point the redirect at a loopback URI (or set
 
 ---
 
-## 3. ⚠️ The one rule that will break things
+## 3. ⚠️ Token-store discipline
 
-**Only one token store may be live per Jobber app.**
+**Prefer one live token store per Jobber app.**
 
-A single Jobber app backs both local and team use. Consequence:
-
-> Now that the hosted server is running, **do not also run the stdio server
-> against the same app.** Each will invalidate the other's refresh token, and
-> recovery means re-running `npm run authorize`.
+This is less severe than earlier versions of this document claimed, because
+rotation is disabled on this app (§2.4): two stores hold the same,
+never-changing refresh token rather than invalidating each other on every
+refresh. The rule still stands for two reasons — overlapping refreshes are
+rejected regardless of rotation, and if rotation is ever enabled on the app the
+original hazard returns in full.
 
 The supported setup:
 
@@ -71,9 +81,29 @@ The supported setup:
 - Everyone — including you, locally — connects to it over HTTP with the bearer
   secret. See §7.
 
-**Within** a single store, concurrency is safe: `TokenStore` takes an O_EXCL
+**Within** a single store, concurrency is handled: `TokenStore` takes an O_EXCL
 lockfile and a process that loses the race re-reads and adopts the winner's
 tokens rather than replaying a spent one.
+
+### Recovering a dead refresh token
+
+Observed once, on 2026-08-04: refreshes began failing with `The provided
+refresh token is not valid`, taking the server down an hour after the last
+successful refresh. **The cause was never conclusively established** — with
+rotation disabled, ordinary refreshes should not consume the token. The most
+plausible trigger is two containers overlapping during a rolling deploy that
+coincided with access-token expiry.
+
+Recovery, in this order (the order matters):
+
+```bash
+npm run authorize                      # 1. interactive; prints a new refresh token
+```
+2. Update `JOBBER_REFRESH_TOKEN` in Coolify.
+3. **Delete `/data/tokens.json` on the volume.** `hydrateFromStore` prefers the
+   stored token over the env value, so a stale store silently re-adopts the
+   dead token and the redeploy changes nothing.
+4. Redeploy, then call any tool to confirm a clean refresh.
 
 If you need to hit Jobber directly from a script, take the **access** token from
 the deployed container and never the refresh token — that is exactly what

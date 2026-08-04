@@ -304,15 +304,18 @@ export function createMcpServer(client: JobberClient): Server {
         return `[jobber api] ${costs.length} request(s), cost ${actual} (requested ${requested})${budget}${waited}`;
       };
 
+      // Appended INSIDE the first block, not as a second one: MCP log
+      // notifications are optional for clients to render (Claude Code routes
+      // them to the debug log, not the transcript), and a second content block
+      // is not reliably shown either. The primary block always is.
+      const showCost = process.env.JOBBER_SHOW_API_COST === '1' && costs.length > 0;
+
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify(result, null, 2) + (showCost ? `\n\n${costLine()}` : ''),
           },
-          ...(process.env.JOBBER_SHOW_API_COST === '1' && costs.length
-            ? [{ type: 'text' as const, text: costLine() }]
-            : []),
         ],
         structuredContent: result,
         _meta: {

@@ -4,6 +4,22 @@
 
 import type { JobberConfig, Connection, PaginationVariables } from '../types/jobber.js';
 import { accessTokenExpiry, refreshTokens } from '../auth/oauth.js';
+import { reportThrottleWait, reportQueryCost, type ThrottleStatus } from '../throttle-context.js';
+
+/** Total attempts (including the first) before surfacing a rate-limit error. */
+const MAX_THROTTLE_ATTEMPTS = 5;
+/** Never sleep longer than this in one go — a caller is waiting on us. */
+const MAX_THROTTLE_WAIT_MS = 20_000;
+/** Assumed cost before Jobber has told us what a request actually costs. */
+const DEFAULT_QUERY_COST = 50;
+
+/**
+ * Jobber signals throttling as HTTP 200 with an error message, not a 429, so
+ * this has to match on the body.
+ */
+function isThrottleError(errors: any[]): boolean {
+  return errors.some((e) => /throttl|rate limit/i.test(String(e?.message ?? '')));
+}
 
 // Jobber does NOT reject an unknown version — it silently falls back to a
 // long-deprecated one (2022-09-01) and only reports that in
@@ -60,28 +76,167 @@ export class JobberClient {
       await this.refresh();
     }
 
-    let response = await this.send(query, variables);
+    for (let attempt = 1; ; attempt++) {
+      // Pace ourselves before spending: one shared client means a burst of tool
+      // calls from several users draws on the same bucket.
+      await this.awaitBudget(attempt);
 
-    // Belt and braces: a token can be revoked or expire early, and Jobber
-    // answers with 401. Refresh once and replay the request.
-    if (response.status === 401) {
-      await this.refresh();
-      response = await this.send(query, variables);
+      let response = await this.send(query, variables);
+
+      // Belt and braces: a token can be revoked or expire early, and Jobber
+      // answers with 401. Refresh once and replay the request.
+      if (response.status === 401) {
+        await this.refresh();
+        response = await this.send(query, variables);
+      }
+
+      // A 429 has no JSON body worth parsing; retry on the header's schedule.
+      if (response.status === 429) {
+        if (attempt >= MAX_THROTTLE_ATTEMPTS) {
+          throw new Error(this.throttleMessage(attempt));
+        }
+        const retryAfter = Number(response.headers.get('retry-after'));
+        await this.sleepForThrottle(
+          Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : this.backoff(attempt),
+          attempt,
+          'throttled'
+        );
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Jobber API error: ${response.status} ${response.statusText}`);
+      }
+
+      const result: any = await response.json();
+
+      // Jobber reports the leaky-bucket state on every response. Recording it
+      // is what makes the pacing above possible.
+      this.recordThrottleStatus(result);
+
+      if (result.errors) {
+        // Throttling arrives as HTTP 200 with an error message, NOT as a 429,
+        // so this has to be detected on the body rather than the status.
+        if (isThrottleError(result.errors) && attempt < MAX_THROTTLE_ATTEMPTS) {
+          await this.sleepForThrottle(this.throttleWaitMs(result, attempt), attempt, 'throttled');
+          continue;
+        }
+        if (isThrottleError(result.errors)) {
+          throw new Error(this.throttleMessage(attempt));
+        }
+        throw new Error(
+          `GraphQL errors: ${result.errors.map((e: any) => e.message).join(', ')}`
+        );
+      }
+
+      return result.data;
     }
+  }
 
-    if (!response.ok) {
-      throw new Error(`Jobber API error: ${response.status} ${response.statusText}`);
+  /** Last budget snapshot Jobber gave us, and when. */
+  private throttle: ThrottleStatus | null = null;
+  private throttleSeenAt = 0;
+  /** Cost of the most recent request, used to size the next wait. */
+  private lastRequestedCost = DEFAULT_QUERY_COST;
+
+  /** Expose the latest known budget (for diagnostics and result metadata). */
+  getThrottleStatus(): (ThrottleStatus & { projectedAvailable: number }) | null {
+    if (!this.throttle) return null;
+    return { ...this.throttle, projectedAvailable: this.projectedAvailable() };
+  }
+
+  private recordThrottleStatus(result: any): void {
+    const cost = result?.extensions?.cost;
+    if (!cost) return;
+    if (typeof cost.requestedQueryCost === 'number') {
+      this.lastRequestedCost = cost.requestedQueryCost;
     }
-
-    const result: any = await response.json();
-
-    if (result.errors) {
-      throw new Error(
-        `GraphQL errors: ${result.errors.map((e: any) => e.message).join(', ')}`
-      );
+    const status = cost.throttleStatus;
+    if (status && typeof status.currentlyAvailable === 'number') {
+      this.throttle = status;
+      this.throttleSeenAt = Date.now();
     }
+    // Attribute the spend to whichever tool call is in flight. Reported per
+    // request because one tool may issue several queries.
+    reportQueryCost({
+      requestedQueryCost: cost.requestedQueryCost ?? 0,
+      actualQueryCost: cost.actualQueryCost ?? 0,
+      throttleStatus: status,
+    });
+  }
 
-    return result.data;
+  /**
+   * Model the bucket locally: it refills at `restoreRate` points per second, so
+   * availability now is the last reading plus whatever has restored since.
+   */
+  private projectedAvailable(): number {
+    if (!this.throttle) return Infinity;
+    const { currentlyAvailable, restoreRate, maximumAvailable } = this.throttle;
+    const restored = ((Date.now() - this.throttleSeenAt) / 1000) * restoreRate;
+    return Math.min(maximumAvailable, currentlyAvailable + restored);
+  }
+
+  /** Wait until the bucket can plausibly cover another request like the last one. */
+  private async awaitBudget(attempt: number): Promise<void> {
+    if (!this.throttle) return;
+    const needed = this.lastRequestedCost;
+    const available = this.projectedAvailable();
+    if (available >= needed) return;
+
+    const waitMs = Math.min(
+      MAX_THROTTLE_WAIT_MS,
+      Math.ceil(((needed - available) / this.throttle.restoreRate) * 1000)
+    );
+    if (waitMs <= 0) return;
+    await this.sleepForThrottle(waitMs, attempt, 'preemptive');
+  }
+
+  /**
+   * How long until enough points restore to cover this request. Jobber usually
+   * includes the budget even on a throttled response, which beats guessing.
+   */
+  private throttleWaitMs(result: any, attempt: number): number {
+    const status = result?.extensions?.cost?.throttleStatus ?? this.throttle;
+    const needed = result?.extensions?.cost?.requestedQueryCost ?? this.lastRequestedCost;
+    if (status?.restoreRate > 0) {
+      const deficit = needed - status.currentlyAvailable;
+      if (deficit > 0) {
+        return Math.min(MAX_THROTTLE_WAIT_MS, Math.ceil((deficit / status.restoreRate) * 1000));
+      }
+    }
+    return this.backoff(attempt);
+  }
+
+  /** Exponential backoff with jitter, for when Jobber tells us nothing useful. */
+  private backoff(attempt: number): number {
+    const base = Math.min(MAX_THROTTLE_WAIT_MS, 500 * 2 ** (attempt - 1));
+    return Math.round(base * (0.5 + Math.random() * 0.5));
+  }
+
+  private async sleepForThrottle(
+    waitMs: number,
+    attempt: number,
+    reason: 'throttled' | 'preemptive'
+  ): Promise<void> {
+    reportThrottleWait({
+      waitMs,
+      attempt,
+      maxAttempts: MAX_THROTTLE_ATTEMPTS,
+      reason,
+      throttleStatus: this.throttle ?? undefined,
+    });
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  private throttleMessage(attempts: number): string {
+    const s = this.throttle;
+    const budget = s
+      ? ` Budget ${Math.round(this.projectedAvailable())}/${s.maximumAvailable}, restoring ${s.restoreRate}/s.`
+      : '';
+    return (
+      `Jobber rate limit exceeded after ${attempts} attempts.${budget} ` +
+      `Retry with a smaller limit, fewer nested fields, or less concurrency.`
+    );
   }
 
   private send(query: string, variables?: Record<string, any>): Promise<Response> {

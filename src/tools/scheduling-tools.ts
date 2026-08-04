@@ -19,6 +19,14 @@
  *   - `VisitStatusTypeEnum` is ACTIVE/COMPLETED/LATE/TODAY/UNSCHEDULED/UPCOMING
  *     — not the UNSCHEDULED/SCHEDULED/IN_PROGRESS/COMPLETED/CANCELLED set this
  *     file used to declare.
+ *   - `updateFutureVisits(input: UpdateFutureVisitsInput!)` bulk-edits future
+ *     visits on a recurring job by propagating a reference visit's settings
+ *     forward; it queues an async job and its payload is just
+ *     `{ success, userErrors }` — no visit list comes back.
+ *   - `onMyWayTrackingLinkCreate(visitId, input)` does NOT generate a tracking
+ *     URL — `OnMyWayTrackingLinkCreateInput.onMyWayTrackingLink` is a `Url!`
+ *     the caller supplies (e.g. from a fleet/dispatch provider). Jobber just
+ *     attaches that link to the visit for the client to see.
  */
 
 import { z } from 'zod';
@@ -391,6 +399,94 @@ export const schedulingTools = {
       }
 
       return { visit: data.visitEditAssignedUsers.visit };
+    },
+  },
+
+  update_future_visits: {
+    description:
+      'Bulk-edit future visits on a recurring job by propagating settings forward from a reference visit. This queues an async operation — the response only reports whether it was successfully queued, not the resulting visits. copyOptions controls what gets copied (time, team assignment, quantity overrides); dispatchRecurrenceRule (an iCalendar RRULE) changes the recurrence pattern going forward, and if omitted the existing visit dates are kept.',
+    inputSchema: z.object({
+      visitId: z.string().describe("Reference visit whose settings are propagated to future visits in its recurring chain"),
+      copyTime: z.boolean().optional().describe("Copy the reference visit's time settings forward"),
+      copyAssignment: z.boolean().optional().describe("Copy the reference visit's team assignment forward"),
+      copyOverride: z.boolean().optional().describe("Copy the reference visit's quantity overrides forward"),
+      dispatchRecurrenceRule: z
+        .string()
+        .optional()
+        .describe('An iCalendar RRULE controlling how future visits are scheduled going forward'),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation UpdateFutureVisits($input: UpdateFutureVisitsInput!) {
+          updateFutureVisits(input: $input) {
+            success
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const copyOptions: Record<string, unknown> = {};
+      if (args.copyTime !== undefined) copyOptions.time = args.copyTime;
+      if (args.copyAssignment !== undefined) copyOptions.assignment = args.copyAssignment;
+      if (args.copyOverride !== undefined) copyOptions.override = args.copyOverride;
+
+      const input: Record<string, unknown> = { visitId: args.visitId };
+      if (Object.keys(copyOptions).length > 0) input.copyOptions = copyOptions;
+      if (args.dispatchRecurrenceRule) input.dispatchRecurrenceRule = args.dispatchRecurrenceRule;
+
+      const data = await client.mutate(mutation, { input });
+
+      if (data.updateFutureVisits.userErrors?.length > 0) {
+        throw new Error(
+          `Future visit update failed: ${data.updateFutureVisits.userErrors.map((e: any) => e.message).join(', ')}`
+        );
+      }
+
+      return { success: data.updateFutureVisits.success };
+    },
+  },
+
+  create_on_my_way_link: {
+    description:
+      'Attach a customer-facing "on my way" arrival tracking link to a visit. The tracking URL itself is supplied by the caller (e.g. from a fleet/dispatch tracking provider) — Jobber does not generate the URL, it just associates an existing one with the visit for the client to view.',
+    inputSchema: z.object({
+      visitId: z.string(),
+      trackingLink: z.string().describe('The URL of the tracking link to attach to this visit'),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation CreateOnMyWayLink($visitId: EncodedId!, $input: OnMyWayTrackingLinkCreateInput!) {
+          onMyWayTrackingLinkCreate(visitId: $visitId, input: $input) {
+            onMyWayTrackingLink {
+              trackingLink
+              vehicle {
+                id
+                name
+                make
+                model
+                licensePlate
+              }
+              visit {
+                ${JobberClient.visitFields}
+              }
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, {
+        visitId: args.visitId,
+        input: { onMyWayTrackingLink: args.trackingLink },
+      });
+
+      if (data.onMyWayTrackingLinkCreate.userErrors?.length > 0) {
+        throw new Error(
+          `On-my-way link creation failed: ${data.onMyWayTrackingLinkCreate.userErrors.map((e: any) => e.message).join(', ')}`
+        );
+      }
+
+      return { onMyWayTrackingLink: data.onMyWayTrackingLinkCreate.onMyWayTrackingLink };
     },
   },
 };

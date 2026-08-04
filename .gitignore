@@ -8,3 +8,6 @@ dist/
 
 # Scratch outDir used by scripts/audit-tools.mjs
 .audit-dist/
+
+# Per-agent scratch outDirs (concurrent tsc runs)
+.agent-*-dist/

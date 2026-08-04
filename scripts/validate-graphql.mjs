@@ -15,7 +15,7 @@
  * Schema comes from JOBBER_SCHEMA_JSON (introspection result), default
  * ./schema/jobber-schema.json.
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { buildClientSchema, parse, validate, specifiedRules } from 'graphql';
@@ -99,13 +99,6 @@ function sampleFor(def, key = '') {
   }
 }
 
-const MODULES = [
-  'jobs-tools', 'clients-tools', 'quotes-tools', 'invoices-tools',
-  'scheduling-tools', 'team-tools', 'expenses-tools', 'products-tools',
-  'requests-tools', 'reporting-tools', 'properties-tools', 'timesheets-tools',
-  'line-items-tools', 'forms-tools', 'taxes-tools',
-];
-
 const args = process.argv.slice(2);
 const asJson = args.includes('--json');
 const onlyTool = args.includes('--tool') ? args[args.indexOf('--tool') + 1] : null;
@@ -114,6 +107,13 @@ const onlyModule = args.includes('--module') ? args[args.indexOf('--module') + 1
 const distDir = args.includes('--dist')
   ? resolve(args[args.indexOf('--dist') + 1])
   : join(root, 'dist');
+
+// Discovered from disk so a newly added tool module is validated automatically
+// rather than silently skipped because someone forgot this list.
+const MODULES = readdirSync(join(distDir, 'tools'))
+  .filter((f) => f.endsWith('-tools.js'))
+  .map((f) => f.replace(/\.js$/, ''))
+  .sort();
 
 const results = [];
 

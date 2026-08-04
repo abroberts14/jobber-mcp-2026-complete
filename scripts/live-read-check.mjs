@@ -15,6 +15,7 @@
  *
  *   JOBBER_ACCESS_TOKEN=... node scripts/live-read-check.mjs [--verbose]
  */
+import { readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
@@ -30,14 +31,34 @@ if (!token) {
   process.exit(2);
 }
 
+// Fail fast on a stale token. Without credentials the client would try to
+// refresh, get "client id and secret do not match", and report that identical
+// OAuth error against every single tool — which reads like the tools broke.
+const claims = (() => {
+  try {
+    return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+  } catch {
+    return null;
+  }
+})();
+if (claims?.exp && claims.exp * 1000 <= Date.now()) {
+  const agoMin = Math.round((Date.now() - claims.exp * 1000) / 60000);
+  console.error(
+    `JOBBER_ACCESS_TOKEN expired ${agoMin} min ago.\n` +
+      `Access tokens last 60 minutes. Make the deployed server refresh (any tool\n` +
+      `call against it will do), then re-read /data/tokens.json for a fresh one.`
+  );
+  process.exit(2);
+}
+
 const { JobberClient } = await import(join(distDir, 'clients', 'jobber.js'));
 
-const MODULES = [
-  'jobs-tools', 'clients-tools', 'quotes-tools', 'invoices-tools',
-  'scheduling-tools', 'team-tools', 'expenses-tools', 'products-tools',
-  'requests-tools', 'reporting-tools', 'properties-tools', 'timesheets-tools',
-  'line-items-tools', 'forms-tools', 'taxes-tools',
-];
+// Discovered from disk so a newly added tool module is validated automatically
+// rather than silently skipped because someone forgot this list.
+const MODULES = readdirSync(join(distDir, 'tools'))
+  .filter((f) => f.endsWith('-tools.js'))
+  .map((f) => f.replace(/\.js$/, ''))
+  .sort();
 
 const READ_ONLY = /^(list_|get_|search_)/;
 

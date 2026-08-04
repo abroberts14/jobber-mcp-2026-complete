@@ -1,0 +1,44 @@
+# Coolify deployment unit for jobber-mcp.
+#
+# Modelled on baseball-model's setup: Coolify builds this on the Mac mini's
+# Colima VM, Traefik (coolify-proxy) routes to it by Host header, and the
+# existing cloudflared-tunnel Service publishes it. No host ports are exposed —
+# the tunnel is the only ingress.
+#
+# Coolify injects ${...} from its Environment Variables UI. Nothing secret is
+# committed here.
+services:
+  jobber-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      JOBBER_CLIENT_ID: ${JOBBER_CLIENT_ID}
+      JOBBER_CLIENT_SECRET: ${JOBBER_CLIENT_SECRET}
+      # Bootstrap only. Once the server refreshes, the live token lives on the
+      # volume below and this value is stale — that is expected.
+      JOBBER_REFRESH_TOKEN: ${JOBBER_REFRESH_TOKEN}
+      # Shared bearer secret for the team. Without it the server refuses to
+      # start: these tools can mutate the Jobber account.
+      JOBBER_MCP_SECRET: ${JOBBER_MCP_SECRET}
+      JOBBER_TOKEN_STORE: /data/tokens.json
+      PORT: "3000"
+    volumes:
+      # Rotated refresh tokens must outlive any single container. During a
+      # rolling deploy both containers share this volume; the store's lockfile
+      # is what keeps them from spending the same single-use token twice.
+      - jobber-tokens:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 6s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  jobber-tokens:

@@ -114,6 +114,86 @@ startup. If the store is deleted, re-run `npm run authorize`.
 | `JOBBER_API_URL` | no | GraphQL endpoint override |
 | `JOBBER_OAUTH_URL` | no | OAuth endpoint override |
 | `JOBBER_GRAPHQL_VERSION` | no | `X-JOBBER-GRAPHQL-VERSION` header |
+| `JOBBER_MCP_SECRET` | HTTP only | Shared bearer secret gating the HTTP transport |
+| `JOBBER_MCP_PATH` | no | HTTP endpoint path (default `/mcp`) |
+| `PORT` | no | HTTP listen port (default `3000`) |
+
+## Hosting it for a team
+
+The server ships two transports:
+
+- **stdio** (`dist/index.js`) — one subprocess per MCP client, the default for local use.
+- **Streamable HTTP** (`dist/http.js`) — one shared service the whole team points at.
+
+The HTTP transport is **single-tenant**: every caller acts as the one Jobber
+account this server is authorized against. It is an access gate for a team that
+already shares an account, not a multi-user system.
+
+### Only one token chain can be live at a time
+
+This is the trap. Jobber rotates the refresh token on every refresh and the old
+one dies immediately, so **exactly one token store may be in use per Jobber
+app**. Once the hosted server is running, a laptop still running the stdio
+server against the same app will break — each one keeps invalidating the
+other's token.
+
+Pick one:
+
+- **Everyone uses the hosted server.** Remove local stdio MCP registrations.
+- **Register a second Jobber app** for local development, with its own client
+  ID/secret and its own token chain.
+
+Within a single store, concurrent refreshes are safe: the store takes a lockfile
+and a process that loses the race adopts the winner's tokens instead of
+replaying a spent one. That covers several MCP clients on one machine and
+overlapping containers during a rolling deploy — but it cannot coordinate two
+*different* stores.
+
+### Running the HTTP transport
+
+```bash
+export JOBBER_MCP_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
+npm run start:http
+```
+
+The server refuses to start without `JOBBER_MCP_SECRET`. That is deliberate: the
+tool set includes mutations (`create_job`, `close_job`, `archive_client`,
+`create_invoice`, …), so an unauthenticated public endpoint would let anyone who
+finds the URL write to your Jobber account. Note that `readOnlyHint` is derived
+from the tool name and is advisory only — there is no server-enforced read-only
+mode.
+
+Clients connect with the secret as a bearer token:
+
+```json
+"jobber": {
+  "type": "http",
+  "url": "https://jobber-mcp.example.com/mcp",
+  "headers": { "Authorization": "Bearer <JOBBER_MCP_SECRET>" }
+}
+```
+
+`GET /health` is unauthenticated and returns `{"status":"ok"}` for container
+health gates.
+
+### Docker / Coolify
+
+`Dockerfile` and `docker-compose.yaml` build a production image that runs the
+HTTP transport as a non-root user on port 3000.
+
+Tokens live at `/data/tokens.json` on a mounted volume. **This volume is not
+optional** — without it, every redeploy loses the rotated refresh token and
+someone has to re-run `npm run authorize` by hand.
+
+Bootstrapping a deployment:
+
+1. Run `npm run authorize` locally to get a fresh refresh token.
+2. Set `JOBBER_CLIENT_ID`, `JOBBER_CLIENT_SECRET`, `JOBBER_REFRESH_TOKEN`, and
+   `JOBBER_MCP_SECRET` in the deployment environment.
+3. Deploy. On first boot the server exchanges the bootstrap token and writes the
+   rotated pair to the volume; from then on the volume is the source of truth
+   and the `JOBBER_REFRESH_TOKEN` value is stale by design.
+4. Stop using the stdio server locally against the same Jobber app (see above).
 
 ## Available Tools
 

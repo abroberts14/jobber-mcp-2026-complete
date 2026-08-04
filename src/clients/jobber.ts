@@ -102,24 +102,43 @@ export class JobberClient {
     // so two parallel refreshes would invalidate each other.
     if (this.refreshInFlight) return this.refreshInFlight;
 
-    this.refreshInFlight = (async () => {
-      const tokens = await refreshTokens({
-        clientId: this.config.clientId,
-        clientSecret: this.config.clientSecret,
-        refreshToken: this.refreshToken,
-        oauthUrl: this.config.oauthUrl,
-      });
+    const run = () => this.refreshLocked();
+    const withLock = this.config.withLock;
 
-      this.accessToken = tokens.accessToken;
-      this.refreshToken = tokens.refreshToken;
-      this.expiresAt = tokens.expiresAt;
-
-      await this.config.onTokensRefreshed?.(tokens);
-    })().finally(() => {
+    this.refreshInFlight = (withLock ? withLock(run) : run()).finally(() => {
       this.refreshInFlight = null;
     });
 
     return this.refreshInFlight;
+  }
+
+  /** Runs with the cross-process lock held, when one is configured. */
+  private async refreshLocked(): Promise<void> {
+    // Another process may have refreshed while we queued on the lock. Adopting
+    // its tokens avoids spending a refresh token that is already dead.
+    const persisted = await this.config.loadTokens?.();
+    if (persisted?.refreshToken) {
+      this.refreshToken = persisted.refreshToken;
+
+      if (persisted.accessToken && Date.now() < persisted.expiresAt) {
+        this.accessToken = persisted.accessToken;
+        this.expiresAt = persisted.expiresAt;
+        return;
+      }
+    }
+
+    const tokens = await refreshTokens({
+      clientId: this.config.clientId,
+      clientSecret: this.config.clientSecret,
+      refreshToken: this.refreshToken,
+      oauthUrl: this.config.oauthUrl,
+    });
+
+    this.accessToken = tokens.accessToken;
+    this.refreshToken = tokens.refreshToken;
+    this.expiresAt = tokens.expiresAt;
+
+    await this.config.onTokensRefreshed?.(tokens);
   }
 
   /**

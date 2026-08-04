@@ -9,8 +9,9 @@
     "jobber-mcp-authorize": "./dist/auth/authorize-cli.js"
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js dist/auth/authorize-cli.js",
+    "build": "tsc && chmod +x dist/index.js dist/http.js dist/auth/authorize-cli.js",
     "dev": "tsc --watch",
+    "start:http": "node dist/http.js",
     "authorize": "npm run build && node dist/auth/authorize-cli.js",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build"

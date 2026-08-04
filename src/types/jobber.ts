@@ -14,6 +14,17 @@ export interface JobberConfig {
   graphqlVersion?: string;
   /** Called whenever Jobber rotates the refresh token, so it can be persisted. */
   onTokensRefreshed?: (tokens: JobberTokens) => void | Promise<void>;
+  /**
+   * Re-read persisted tokens. Called inside `withLock` just before refreshing,
+   * so a process that lost the race picks up the winner's tokens rather than
+   * replaying a refresh token that has already been spent.
+   */
+  loadTokens?: () => Promise<JobberTokens | null>;
+  /**
+   * Serialise refreshes across processes sharing a token store. Without it,
+   * refreshes are only serialised within this process.
+   */
+  withLock?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 export interface JobberTokens {

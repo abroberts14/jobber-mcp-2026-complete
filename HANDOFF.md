@@ -7,8 +7,9 @@ account unless explicitly marked otherwise.
 
 ## 1. What this is
 
-An MCP server exposing **86 tools** over Jobber's GraphQL API (15 tool modules
-under `src/tools/`). It ships two transports:
+An MCP server exposing **108 tools** over Jobber's GraphQL API — 107 Jobber
+tools across 19 modules under `src/tools/`, plus a `help` tool. It ships two
+transports:
 
 | Transport | Entry point | Use |
 | --- | --- | --- |
@@ -213,10 +214,13 @@ All three are **fully offline and never send a mutation.**
 | Check | Result |
 | --- | --- |
 | `tsc --noEmit` | exit 0 |
-| Document validation | **86/86** |
-| Deep audit (documents + variables + response shape) | **86/86** |
-| Live read-only run against real Jobber | **37 passed, 0 failed, 4 skipped** |
-| Live mutation run against the sandbox | **38 passed, 4 failed** |
+| Document validation | **107/107** |
+| Deep audit (documents + variables + response shape) | **107/107** |
+| Live read-only run through the deployed server | **41 passed, 0 failed, 6 skipped** |
+| Live mutation run against the sandbox | **38 passed, 4 failed** (see below) |
+
+`help` is not counted: it makes no GraphQL call, so the query validators
+correctly ignore it.
 
 Read skips are `get_payment`, `get_expense`, `get_timesheet_entry`,
 `get_tax_rate` — the account holds no such records, so no real ID exists to
@@ -301,6 +305,27 @@ claude mcp add --transport http jobber https://jobber-mcp.aaronroberts.xyz/mcp \
 ```
 
 `GET /health` is unauthenticated and returns `{"status":"ok"}`.
+
+### Discovering the tool set
+
+`tools/list` carries every schema, but that is a lot of context and it cannot
+express rules that span tools. Call **`help`** first:
+
+| Call | Returns |
+| --- | --- |
+| `help {}` | Categories, cross-cutting conventions, what Jobber does NOT support, workflow recipes |
+| `help { category: "jobs" }` | Tools in one area with their required arguments |
+| `help { tool: "create_job" }` | One tool's full input schema (with did-you-mean on typos) |
+
+The catalog is generated from `TOOL_GROUPS` in `src/server.ts` — the same object
+used for dispatch and the duplicate-name check — so it cannot drift from what is
+actually exposed. `src/help.ts` deliberately sits outside `src/tools/`: it
+issues no GraphQL, and the query validators flag a `tools/` module that never
+produces a document.
+
+The `notSupported` list matters most for other models: it stops them retrying
+things Jobber has no API for (forms, recording payments, sending quotes,
+cross-entity search, deleting most records).
 
 ---
 

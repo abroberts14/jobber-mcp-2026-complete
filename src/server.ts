@@ -15,7 +15,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 import { JobberClient } from './clients/jobber.js';
 import { TokenStore } from './auth/token-store.js';
 import { withThrottleReporter, type ThrottleWait, type QueryCost } from './throttle-context.js';
-import { createHelpTool } from './help.js';
+import { createMetaTools } from './help.js';
 import { jobsTools } from './tools/jobs-tools.js';
 import { clientsTools } from './tools/clients-tools.js';
 import { quotesTools } from './tools/quotes-tools.js';
@@ -85,7 +85,7 @@ const toolGroup = new Map<string, string>();
 
 // Derive readOnlyHint from tool name
 const isReadOnly = (name: string) =>
-  name === 'help' ||
+  name === 'help' || name === 'get_api_budget' ||
   name.startsWith('list_') ||
   name.startsWith('get_') ||
   name.startsWith('search_');
@@ -96,7 +96,7 @@ const allTools: Record<string, any> = Object.assign(
   // Built from TOOL_GROUPS above, so the catalog always matches what is
   // exposed. Deliberately not a src/tools/ module: it issues no GraphQL, and
   // the query validators would flag it for that.
-  createHelpTool(TOOL_GROUPS, isReadOnly)
+  createMetaTools(TOOL_GROUPS, isReadOnly)
 );
 
 /**
@@ -149,10 +149,10 @@ export function createJobberRuntime(): JobberRuntime {
     apiUrl: process.env.JOBBER_API_URL,
     oauthUrl: process.env.JOBBER_OAUTH_URL,
     graphqlVersion: process.env.JOBBER_GRAPHQL_VERSION,
-    // Jobber rotates the refresh token on every refresh; losing the new one
-    // means re-running the authorization flow by hand. The lock keeps
-    // concurrent servers (several MCP clients, or overlapping containers on a
-    // shared volume) from spending the same single-use token twice.
+    // Rotation is a per-app Jobber setting and is OFF for this app, so the
+    // returned refresh token matches the one sent. The lock still matters:
+    // overlapping refreshes are rejected regardless of rotation, and it keeps
+    // several MCP clients (or containers sharing the volume) from racing.
     onTokensRefreshed: (tokens) => tokenStore.write(tokens),
     loadTokens: () => tokenStore.read(),
     withLock: (fn) => tokenStore.withLock(fn),
@@ -162,9 +162,13 @@ export function createJobberRuntime(): JobberRuntime {
 }
 
 /**
- * Seed the client from the token store. Prefer stored tokens over the .env
- * bootstrap values: after the first refresh the .env refresh token is stale and
- * single-use.
+ * Seed the client from the token store, preferring it over the .env bootstrap
+ * values so a live access token survives a restart.
+ *
+ * If the stored refresh token is ever rejected, the client falls back to the
+ * environment value once — otherwise a stale store would keep re-adopting a
+ * dead token and an operator's fix to JOBBER_REFRESH_TOKEN would appear to do
+ * nothing.
  */
 export async function hydrateFromStore(runtime: JobberRuntime): Promise<void> {
   const stored = await runtime.tokenStore.read();
@@ -195,10 +199,15 @@ export function createMcpServer(client: JobberClient): Server {
     return { tools: toolList };
   });
 
-  // Per-request API cost is logged at debug, which is off unless a client asks
-  // for it — otherwise every tool call would emit a notification nobody reads.
+  // Per-request API cost is logged at debug so it stays out of the way by
+  // default. The baseline comes from the environment because the HTTP transport
+  // is stateless — it builds a fresh Server per request, so a `logging/setLevel`
+  // call would be discarded before the next one and debug could never be
+  // reached. setLevel still works within a session on the stdio transport.
   const LEVELS = ['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency'];
-  let logLevel = 'info';
+  let logLevel = LEVELS.includes(process.env.JOBBER_LOG_LEVEL ?? '')
+    ? (process.env.JOBBER_LOG_LEVEL as string)
+    : 'info';
   const enabled = (level: string) => LEVELS.indexOf(level) >= LEVELS.indexOf(logLevel);
 
   server.setRequestHandler(SetLevelRequestSchema, async (request) => {
@@ -281,12 +290,29 @@ export function createMcpServer(client: JobberClient): Server {
 
       const totalWaitMs = waits.reduce((sum, w) => sum + w.waitMs, 0);
 
+      // _meta and logging notifications are both at the client's discretion to
+      // display, and most don't. With JOBBER_SHOW_API_COST=1 the cost goes into
+      // the visible text content instead, where every client shows it.
+      const costLine = () => {
+        const b = client.getThrottleStatus();
+        const requested = costs.reduce((n, c) => n + c.requestedQueryCost, 0);
+        const actual = costs.reduce((n, c) => n + c.actualQueryCost, 0);
+        const budget = b
+          ? `, budget ${Math.round(b.projectedAvailable)}/${b.maximumAvailable}`
+          : '';
+        const waited = totalWaitMs > 0 ? `, rate-limited ${(totalWaitMs / 1000).toFixed(1)}s` : '';
+        return `[jobber api] ${costs.length} request(s), cost ${actual} (requested ${requested})${budget}${waited}`;
+      };
+
       return {
         content: [
           {
             type: 'text',
             text: JSON.stringify(result, null, 2),
           },
+          ...(process.env.JOBBER_SHOW_API_COST === '1' && costs.length
+            ? [{ type: 'text' as const, text: costLine() }]
+            : []),
         ],
         structuredContent: result,
         _meta: {

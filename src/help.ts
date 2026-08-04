@@ -63,7 +63,7 @@ const WORKFLOWS: Record<string, string[]> = {
   ],
 };
 
-export function createHelpTool(
+export function createMetaTools(
   groups: Record<string, Record<string, any>>,
   isReadOnly: (name: string) => boolean
 ) {
@@ -88,6 +88,31 @@ export function createHelpTool(
   });
 
   return {
+    get_api_budget: {
+      description:
+        "Current Jobber API rate-limit budget: points remaining, the ceiling, and the refill rate. Jobber uses a leaky bucket (10,000 points refilling at 500/second) and charges each query by the shape of its selection. Use this to check headroom before a large batch, or to see why calls are being paced. Returns nulls until at least one Jobber call has been made, since the budget is only reported on live responses.",
+      inputSchema: z.object({}),
+      execute: async (client: any) => {
+        const budget = client?.getThrottleStatus?.() ?? null;
+        if (!budget) {
+          return {
+            budget: null,
+            note: 'No Jobber request has been made yet on this server process, so no budget has been reported. Call any list_ tool first.',
+          };
+        }
+        const { maximumAvailable, restoreRate, projectedAvailable } = budget;
+        return {
+          budget,
+          percentRemaining: Math.round((projectedAvailable / maximumAvailable) * 100),
+          secondsToFull: Math.max(
+            0,
+            Math.ceil((maximumAvailable - projectedAvailable) / restoreRate)
+          ),
+          note: 'projectedAvailable accounts for refill since the last observed response. Rate limiting is handled automatically; this is for visibility.',
+        };
+      },
+    },
+
     help: {
       description:
         'Catalog and usage guide for this Jobber MCP server. Call with no arguments for an overview of every tool category plus the conventions that apply across all tools (ID format, enum casing, pagination, what Jobber does NOT support). Pass `category` to list the tools in one area, or `tool` for one tool\'s full input schema. Start here before calling anything else.',

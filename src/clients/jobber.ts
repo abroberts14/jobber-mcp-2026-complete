@@ -285,12 +285,38 @@ export class JobberClient {
       }
     }
 
-    const tokens = await refreshTokens({
-      clientId: this.config.clientId,
-      clientSecret: this.config.clientSecret,
-      refreshToken: this.refreshToken,
-      oauthUrl: this.config.oauthUrl,
-    });
+    let tokens;
+    try {
+      tokens = await refreshTokens({
+        clientId: this.config.clientId,
+        clientSecret: this.config.clientSecret,
+        refreshToken: this.refreshToken,
+        oauthUrl: this.config.oauthUrl,
+      });
+    } catch (error) {
+      // The persisted token can go stale — most importantly right after an
+      // operator fixes JOBBER_REFRESH_TOKEN, since the store is preferred over
+      // the environment and would otherwise keep re-adopting the dead token
+      // until someone deletes the file by hand. Fall back to the bootstrap
+      // value once when it is actually a different token.
+      const bootstrap = this.config.refreshToken;
+      const isDeadToken = /not valid|invalid_grant/i.test(String((error as Error)?.message ?? ''));
+
+      if (!isDeadToken || !bootstrap || bootstrap === this.refreshToken) {
+        throw error;
+      }
+
+      console.error(
+        '[jobber-auth] stored refresh token was rejected; retrying with the ' +
+          'JOBBER_REFRESH_TOKEN from the environment.'
+      );
+      tokens = await refreshTokens({
+        clientId: this.config.clientId,
+        clientSecret: this.config.clientSecret,
+        refreshToken: bootstrap,
+        oauthUrl: this.config.oauthUrl,
+      });
+    }
 
     this.accessToken = tokens.accessToken;
     this.refreshToken = tokens.refreshToken;

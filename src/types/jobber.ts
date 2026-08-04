@@ -3,8 +3,24 @@
  */
 
 export interface JobberConfig {
-  apiToken: string;
+  clientId: string;
+  clientSecret: string;
+  /** Long-lived refresh token from the initial authorization code exchange. */
+  refreshToken: string;
+  /** Optional access token to start with. Refreshed automatically once it expires. */
+  accessToken?: string;
   apiUrl?: string;
+  oauthUrl?: string;
+  graphqlVersion?: string;
+  /** Called whenever Jobber rotates the refresh token, so it can be persisted. */
+  onTokensRefreshed?: (tokens: JobberTokens) => void | Promise<void>;
+}
+
+export interface JobberTokens {
+  accessToken: string;
+  refreshToken: string;
+  /** Epoch milliseconds at which the access token expires. */
+  expiresAt: number;
 }
 
 export interface PageInfo {

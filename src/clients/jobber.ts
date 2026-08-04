@@ -3,29 +3,68 @@
  */
 
 import type { JobberConfig, Connection, PaginationVariables } from '../types/jobber.js';
+import { accessTokenExpiry, refreshTokens } from '../auth/oauth.js';
+
+// Jobber rejects unknown versions with a 404, so this must track a version they
+// still publish. Kept in sync with patcher-api's provider client.
+const DEFAULT_GRAPHQL_VERSION = '2025-01-20';
 
 export class JobberClient {
   private apiUrl: string;
-  private apiToken: string;
+  private graphqlVersion: string;
+  private config: JobberConfig;
+
+  private accessToken: string;
+  private refreshToken: string;
+  private expiresAt: number;
+
+  /** In-flight refresh, so concurrent tool calls share one token request. */
+  private refreshInFlight: Promise<void> | null = null;
 
   constructor(config: JobberConfig) {
     this.apiUrl = config.apiUrl || 'https://api.getjobber.com/api/graphql';
-    this.apiToken = config.apiToken;
+    this.graphqlVersion = config.graphqlVersion || DEFAULT_GRAPHQL_VERSION;
+    this.config = config;
+
+    this.accessToken = config.accessToken || '';
+    this.refreshToken = config.refreshToken;
+    // Expiry 0 means the first request refreshes before sending — the right
+    // default both when we have no access token and when we can't read its exp.
+    this.expiresAt = config.accessToken ? accessTokenExpiry(config.accessToken) ?? 0 : 0;
+  }
+
+  /** Expose the current tokens so callers can persist them. */
+  getTokens() {
+    return {
+      accessToken: this.accessToken,
+      refreshToken: this.refreshToken,
+      expiresAt: this.expiresAt,
+    };
+  }
+
+  /** Seed the client with previously persisted tokens. */
+  setTokens(tokens: { accessToken: string; refreshToken: string; expiresAt: number }): void {
+    this.accessToken = tokens.accessToken;
+    this.refreshToken = tokens.refreshToken;
+    this.expiresAt = tokens.expiresAt;
   }
 
   /**
    * Execute a GraphQL query
    */
   async query<T = any>(query: string, variables?: Record<string, any>): Promise<T> {
-    const response = await fetch(this.apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiToken}`,
-        'X-JOBBER-GRAPHQL-VERSION': '2024-01-11',
-      },
-      body: JSON.stringify({ query, variables }),
-    });
+    if (Date.now() >= this.expiresAt) {
+      await this.refresh();
+    }
+
+    let response = await this.send(query, variables);
+
+    // Belt and braces: a token can be revoked or expire early, and Jobber
+    // answers with 401. Refresh once and replay the request.
+    if (response.status === 401) {
+      await this.refresh();
+      response = await this.send(query, variables);
+    }
 
     if (!response.ok) {
       throw new Error(`Jobber API error: ${response.status} ${response.statusText}`);
@@ -40,6 +79,47 @@ export class JobberClient {
     }
 
     return result.data;
+  }
+
+  private send(query: string, variables?: Record<string, any>): Promise<Response> {
+    return fetch(this.apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.accessToken}`,
+        'X-JOBBER-GRAPHQL-VERSION': this.graphqlVersion,
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+  }
+
+  /**
+   * Swap the refresh token for a fresh access token. Jobber rotates the
+   * refresh token on each call, so the new one must be persisted immediately.
+   */
+  private async refresh(): Promise<void> {
+    // Collapse concurrent refreshes — a rotated refresh token is single-use,
+    // so two parallel refreshes would invalidate each other.
+    if (this.refreshInFlight) return this.refreshInFlight;
+
+    this.refreshInFlight = (async () => {
+      const tokens = await refreshTokens({
+        clientId: this.config.clientId,
+        clientSecret: this.config.clientSecret,
+        refreshToken: this.refreshToken,
+        oauthUrl: this.config.oauthUrl,
+      });
+
+      this.accessToken = tokens.accessToken;
+      this.refreshToken = tokens.refreshToken;
+      this.expiresAt = tokens.expiresAt;
+
+      await this.config.onTokensRefreshed?.(tokens);
+    })().finally(() => {
+      this.refreshInFlight = null;
+    });
+
+    return this.refreshInFlight;
   }
 
   /**

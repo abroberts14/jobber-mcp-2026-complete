@@ -10,7 +10,9 @@ import {
   McpError,
   ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import { JobberClient } from './clients/jobber.js';
+import { TokenStore } from './auth/token-store.js';
 import { jobsTools } from './tools/jobs-tools.js';
 import { clientsTools } from './tools/clients-tools.js';
 import { quotesTools } from './tools/quotes-tools.js';
@@ -49,14 +51,41 @@ const allTools = {
 export class JobberServer {
   private server: Server;
   private client: JobberClient;
+  private tokenStore: TokenStore;
 
   constructor() {
-    const apiToken = process.env.JOBBER_API_TOKEN;
-    if (!apiToken) {
-      throw new Error('JOBBER_API_TOKEN environment variable is required');
+    const clientId = process.env.JOBBER_CLIENT_ID;
+    const clientSecret = process.env.JOBBER_CLIENT_SECRET;
+    const refreshToken = process.env.JOBBER_REFRESH_TOKEN;
+
+    if (!clientId || !clientSecret) {
+      throw new Error(
+        'JOBBER_CLIENT_ID and JOBBER_CLIENT_SECRET are required. ' +
+          'Create an app at https://developer.getjobber.com to get them.'
+      );
+    }
+    if (!refreshToken) {
+      throw new Error(
+        'JOBBER_REFRESH_TOKEN is required. Run `npm run authorize` to complete the ' +
+          'OAuth flow and obtain one — Jobber does not issue static API tokens.'
+      );
     }
 
-    this.client = new JobberClient({ apiToken });
+    this.tokenStore = new TokenStore();
+    this.client = new JobberClient({
+      clientId,
+      clientSecret,
+      refreshToken,
+      accessToken: process.env.JOBBER_ACCESS_TOKEN,
+      apiUrl: process.env.JOBBER_API_URL,
+      graphqlVersion: process.env.JOBBER_GRAPHQL_VERSION,
+      onTokensRefreshed: async (tokens) => {
+        // Jobber rotates the refresh token on every refresh; losing the new one
+        // means re-running the authorization flow by hand.
+        await this.tokenStore.write(tokens);
+      },
+    });
+
     this.server = new Server(
       {
         name: 'jobber-server',
@@ -77,16 +106,18 @@ export class JobberServer {
     const isReadOnly = (name: string) =>
       name.startsWith('list_') || name.startsWith('get_') || name.startsWith('search_');
 
+    // Tool schemas are authored as Zod but MCP requires JSON Schema on the
+    // wire, so convert once at startup rather than per request.
+    const toolList = Object.entries(allTools).map(([name, tool]) => ({
+      name,
+      description: tool.description,
+      inputSchema: zodToJsonSchema(tool.inputSchema, { target: 'jsonSchema7' }),
+      ...(isReadOnly(name) ? { readOnlyHint: true } : {}),
+    }));
+
     // List available tools
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      return {
-        tools: Object.entries(allTools).map(([name, tool]) => ({
-          name,
-          description: tool.description,
-          inputSchema: tool.inputSchema.shape,
-          ...(isReadOnly(name) ? { readOnlyHint: true } : {}),
-        })),
-      };
+      return { tools: toolList };
     });
 
     // Handle tool calls
@@ -130,6 +161,13 @@ export class JobberServer {
   }
 
   async run(): Promise<void> {
+    // Prefer stored tokens over the .env bootstrap values: after the first
+    // refresh the .env refresh token is stale and single-use.
+    const stored = await this.tokenStore.read();
+    if (stored) {
+      this.client.setTokens(stored);
+    }
+
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.error('Jobber MCP server running on stdio');

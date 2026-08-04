@@ -58,17 +58,62 @@ npm run build
 
 ## Configuration
 
-Set your Jobber API token as an environment variable:
+Jobber has no static API keys or personal access tokens. Every request is
+authenticated with an OAuth 2.0 access token that expires after 60 minutes, so
+the server needs your app credentials plus a refresh token and handles the
+refresh cycle itself.
+
+**1. Register an app** at [developer.getjobber.com](https://developer.getjobber.com)
+and note the client ID and client secret. Add a redirect URI —
+`http://localhost:3000/callback` works for local use.
+
+**2. Create your `.env`:**
 
 ```bash
-export JOBBER_API_TOKEN="your_api_token_here"
+cp .env.example .env
 ```
 
-To obtain an API token:
+Fill in `JOBBER_CLIENT_ID`, `JOBBER_CLIENT_SECRET`, and `JOBBER_REDIRECT_URI`.
 
-1. Log into your Jobber account
-2. Navigate to Settings > API Access
-3. Generate a new API token with appropriate permissions
+**3. Authorize once:**
+
+```bash
+npm run authorize
+```
+
+This opens Jobber's consent screen, captures the authorization code on the
+redirect, exchanges it for tokens, and prints a `JOBBER_REFRESH_TOKEN` to paste
+into `.env`.
+
+If your redirect URI goes through a tunnel (ngrok and friends) rather than
+`localhost`, set `JOBBER_CALLBACK_PORT` to the port the tunnel forwards to and
+the code is still captured automatically. Without it, the CLI prompts you to
+paste the `code` parameter from the redirect URL.
+
+**4. Run the server.** It exchanges the refresh token for an access token on
+demand and retries once on a `401`.
+
+### Token rotation
+
+Jobber rotates the refresh token on every refresh, so the value in `.env` is
+single-use. The server writes each new pair to `~/.jobber-mcp/tokens.json`
+(override with `JOBBER_TOKEN_STORE`) and prefers that store over `.env` at
+startup. If the store is deleted, re-run `npm run authorize`.
+
+### Environment variables
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `JOBBER_CLIENT_ID` | yes | App client ID |
+| `JOBBER_CLIENT_SECRET` | yes | App client secret |
+| `JOBBER_REFRESH_TOKEN` | yes | Bootstrap refresh token from `npm run authorize` |
+| `JOBBER_REDIRECT_URI` | for authorize | Must match the URI registered on the app |
+| `JOBBER_CALLBACK_PORT` | no | Local port to catch the redirect on when tunnelling |
+| `JOBBER_ACCESS_TOKEN` | no | Skip the first refresh if you already hold one |
+| `JOBBER_TOKEN_STORE` | no | Rotated-token cache path |
+| `JOBBER_API_URL` | no | GraphQL endpoint override |
+| `JOBBER_OAUTH_URL` | no | OAuth endpoint override |
+| `JOBBER_GRAPHQL_VERSION` | no | `X-JOBBER-GRAPHQL-VERSION` header |
 
 ## Available Tools
 
@@ -778,7 +823,9 @@ This server uses Jobber's GraphQL API. All tools execute GraphQL queries and mut
 
 ### Authentication
 
-API requests require a valid Jobber API token passed via the `JOBBER_API_TOKEN` environment variable.
+Requests are authenticated with an OAuth 2.0 bearer token. Jobber access tokens
+expire after 60 minutes; the server refreshes them automatically using the
+client credentials and refresh token from [Configuration](#configuration).
 
 ### Rate Limiting
 

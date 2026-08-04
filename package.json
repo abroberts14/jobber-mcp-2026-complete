@@ -5,22 +5,30 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "jobber-mcp": "./dist/index.js"
+    "jobber-mcp": "./dist/index.js",
+    "jobber-mcp-authorize": "./dist/auth/authorize-cli.js"
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js",
+    "build": "tsc && chmod +x dist/index.js dist/auth/authorize-cli.js",
     "dev": "tsc --watch",
+    "authorize": "npm run build && node dist/auth/authorize-cli.js",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["mcp", "jobber", "field-service", "graphql"],
+  "keywords": [
+    "mcp",
+    "jobber",
+    "field-service",
+    "graphql"
+  ],
   "author": "MCPEngine",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "zod": "^3.24.1"
+    "zod": "^3.24.1",
+    "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",

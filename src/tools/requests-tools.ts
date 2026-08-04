@@ -1,50 +1,102 @@
 /**
  * Requests Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27. Notable shape differences from a
+ * naive reading of the API:
+ *   - IDs are `EncodedId`, not `ID`.
+ *   - `Request` has no `description` and no `status` field — it has
+ *     `requestStatus` (lowercase enum values) and a single `salesperson`
+ *     (there is no list of "assigned users").
+ *   - `requestCreate` requires `clientId`; Jobber does not infer the client.
+ *   - `requestEdit` cannot set `requestStatus` directly — status moves via
+ *     dedicated mutations (`requestArchive`/`requestUnarchive`; other
+ *     transitions happen implicitly through quotes/jobs/assessments).
+ *   - There is no `requestConvertToQuote` or `requestConvertToJob` mutation.
  */
 
 import { z } from 'zod';
 import { JobberClient } from '../clients/jobber.js';
 
+/** RequestStatusTypeEnum, verbatim. */
+const REQUEST_STATUS = [
+  'new', 'completed', 'converted', 'archived', 'upcoming', 'overdue',
+  'unscheduled', 'assessment_completed', 'today', 'needs_approval',
+] as const;
+
+const PAGE_INFO = `
+  pageInfo {
+    hasNextPage
+    endCursor
+  }
+  totalCount
+`;
+
+const USER_ERRORS = `
+  userErrors {
+    message
+    path
+  }
+`;
+
+/** Fields common to a Request, excluding sub-connections. */
+const REQUEST_FIELDS = `
+  id
+  title
+  requestStatus
+  source
+  companyName
+  contactName
+  email
+  phone
+  isScheduled
+  createdAt
+  updatedAt
+  client {
+    ${JobberClient.clientFields}
+  }
+  property {
+    id
+  }
+  amounts {
+    total
+  }
+`;
+
 export const requestsTools = {
   list_requests: {
-    description: 'List all client requests',
+    description:
+      'List client requests with optional filtering and pagination. Status values are lowercase (e.g. "new", "converted", "archived") — there is no NEW/IN_PROGRESS/CONVERTED/CLOSED enum.',
     inputSchema: z.object({
-      status: z.enum(['NEW', 'IN_PROGRESS', 'CONVERTED', 'CLOSED']).optional(),
+      status: z.enum(REQUEST_STATUS).optional(),
+      clientId: z.string().optional(),
+      searchTerm: z.string().optional(),
       limit: z.number().default(50),
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filters = args.status ? `, filter: { status: ${args.status} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
+      const filter: Record<string, unknown> = {};
+      if (args.status) filter.status = args.status;
+      if (args.clientId) filter.clientId = args.clientId;
 
       const query = `
-        query ListRequests {
-          requests(first: ${args.limit}${afterClause}${filters}) {
-            edges {
-              node {
-                id
-                title
-                description
-                status
-                createdAt
-                client {
-                  ${JobberClient.clientFields}
-                }
-              }
-              cursor
+        query ListRequests($first: Int, $after: String, $filter: RequestFilterAttributes, $searchTerm: String) {
+          requests(first: $first, after: $after, filter: $filter, searchTerm: $searchTerm) {
+            nodes {
+              ${REQUEST_FIELDS}
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+        searchTerm: args.searchTerm,
+      });
       return {
-        requests: data.requests.edges.map((e: any) => e.node),
+        requests: data.requests.nodes,
         pageInfo: data.requests.pageInfo,
         totalCount: data.requests.totalCount,
       };
@@ -58,16 +110,9 @@ export const requestsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetRequest($id: ID!) {
+        query GetRequest($id: EncodedId!) {
           request(id: $id) {
-            id
-            title
-            description
-            status
-            createdAt
-            client {
-              ${JobberClient.clientFields}
-            }
+            ${REQUEST_FIELDS}
           }
         }
       `;
@@ -78,36 +123,30 @@ export const requestsTools = {
   },
 
   create_request: {
-    description: 'Create a new client request',
+    description:
+      'Create a new client request. clientId is required — Jobber does not derive it from anything else. propertyId defaults to the client\'s last property when omitted.',
     inputSchema: z.object({
-      title: z.string(),
-      description: z.string().optional(),
-      clientId: z.string().optional(),
+      clientId: z.string().describe('The client this request is for'),
+      propertyId: z.string().optional(),
+      title: z.string().optional(),
+      salespersonId: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CreateRequest($input: RequestInput!) {
+        mutation CreateRequest($input: RequestCreateInput!) {
           requestCreate(input: $input) {
             request {
-              id
-              title
-              description
-              status
-              createdAt
+              ${REQUEST_FIELDS}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = {
-        title: args.title,
-        description: args.description,
-        clientId: args.clientId,
-      };
+      const input: Record<string, unknown> = { clientId: args.clientId };
+      if (args.propertyId) input.propertyId = args.propertyId;
+      if (args.title) input.title = args.title;
+      if (args.salespersonId) input.salespersonId = args.salespersonId;
 
       const data = await client.mutate(mutation, { input });
 
@@ -120,142 +159,127 @@ export const requestsTools = {
   },
 
   update_request: {
-    description: 'Update an existing request',
+    description:
+      'Update an existing request\'s title, property, or salesperson. Request status cannot be set through this mutation — use archive_request / unarchive_request for status transitions.',
     inputSchema: z.object({
       requestId: z.string(),
       title: z.string().optional(),
-      description: z.string().optional(),
-      status: z.enum(['NEW', 'IN_PROGRESS', 'CONVERTED', 'CLOSED']).optional(),
+      propertyId: z.string().optional(),
+      salespersonId: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation UpdateRequest($id: ID!, $input: RequestUpdateInput!) {
-          requestUpdate(id: $id, input: $input) {
+        mutation UpdateRequest($requestId: EncodedId!, $input: RequestEditInput!) {
+          requestEdit(requestId: $requestId, input: $input) {
             request {
-              id
-              title
-              description
-              status
-              createdAt
+              ${REQUEST_FIELDS}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input: any = {};
+      const input: Record<string, unknown> = {};
       if (args.title) input.title = args.title;
-      if (args.description) input.description = args.description;
-      if (args.status) input.status = args.status;
+      if (args.propertyId) input.propertyId = args.propertyId;
+      if (args.salespersonId) input.salespersonId = args.salespersonId;
 
-      const data = await client.mutate(mutation, { id: args.requestId, input });
+      const data = await client.mutate(mutation, { requestId: args.requestId, input });
 
-      if (data.requestUpdate.userErrors?.length > 0) {
-        throw new Error(`Request update failed: ${data.requestUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.requestEdit.userErrors?.length > 0) {
+        throw new Error(`Request update failed: ${data.requestEdit.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { request: data.requestUpdate.request };
+      return { request: data.requestEdit.request };
     },
   },
 
-  convert_request_to_quote: {
-    description: 'Convert a request to a quote',
+  archive_request: {
+    description: 'Archive a request (sets its status to archived)',
     inputSchema: z.object({
       requestId: z.string(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation ConvertRequestToQuote($id: ID!) {
-          requestConvertToQuote(id: $id) {
-            quote {
-              ${JobberClient.quoteFields}
+        mutation ArchiveRequest($requestId: EncodedId!) {
+          requestArchive(requestId: $requestId) {
+            request {
+              ${REQUEST_FIELDS}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const data = await client.mutate(mutation, { id: args.requestId });
+      const data = await client.mutate(mutation, { requestId: args.requestId });
 
-      if (data.requestConvertToQuote.userErrors?.length > 0) {
-        throw new Error(`Request conversion to quote failed: ${data.requestConvertToQuote.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.requestArchive.userErrors?.length > 0) {
+        throw new Error(`Request archive failed: ${data.requestArchive.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { quote: data.requestConvertToQuote.quote };
+      return { request: data.requestArchive.request };
     },
   },
 
-  convert_request_to_job: {
-    description: 'Convert a request directly to a job',
+  unarchive_request: {
+    description: 'Unarchive a previously archived request',
     inputSchema: z.object({
       requestId: z.string(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation ConvertRequestToJob($id: ID!) {
-          requestConvertToJob(id: $id) {
-            job {
-              ${JobberClient.jobFields}
+        mutation UnarchiveRequest($requestId: EncodedId!) {
+          requestUnarchive(requestId: $requestId) {
+            request {
+              ${REQUEST_FIELDS}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const data = await client.mutate(mutation, { id: args.requestId });
+      const data = await client.mutate(mutation, { requestId: args.requestId });
 
-      if (data.requestConvertToJob.userErrors?.length > 0) {
-        throw new Error(`Request conversion to job failed: ${data.requestConvertToJob.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.requestUnarchive.userErrors?.length > 0) {
+        throw new Error(`Request unarchive failed: ${data.requestUnarchive.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { job: data.requestConvertToJob.job };
+      return { request: data.requestUnarchive.request };
     },
   },
 
   assign_request: {
-    description: 'Assign a request to a specific user/team member',
+    description:
+      'Assign a request to a salesperson. A Request has a single `salesperson`, not a list of assigned users, so this sets (and replaces) that one user.',
     inputSchema: z.object({
       requestId: z.string().describe('The request ID to assign'),
-      userId: z.string().describe('The user ID to assign the request to'),
+      userId: z.string().describe('The user ID to set as the request salesperson'),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation AssignRequest($id: ID!, $input: RequestUpdateInput!) {
-          requestUpdate(id: $id, input: $input) {
+        mutation AssignRequest($requestId: EncodedId!, $input: RequestEditInput!) {
+          requestEdit(requestId: $requestId, input: $input) {
             request {
               id
               title
-              status
-              assignedUsers {
-                id
-                firstName
-                lastName
-                email
+              requestStatus
+              salesperson {
+                ${JobberClient.userFields}
               }
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = { assignedUserIds: [args.userId] };
-      const data = await client.mutate(mutation, { id: args.requestId, input });
+      const input = { salespersonId: args.userId };
+      const data = await client.mutate(mutation, { requestId: args.requestId, input });
 
-      if (data.requestUpdate.userErrors?.length > 0) {
-        throw new Error(`Request assignment failed: ${data.requestUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.requestEdit.userErrors?.length > 0) {
+        throw new Error(`Request assignment failed: ${data.requestEdit.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { request: data.requestUpdate.request };
+      return { request: data.requestEdit.request };
     },
   },
 };

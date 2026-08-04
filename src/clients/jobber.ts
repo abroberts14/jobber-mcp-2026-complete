@@ -5,9 +5,12 @@
 import type { JobberConfig, Connection, PaginationVariables } from '../types/jobber.js';
 import { accessTokenExpiry, refreshTokens } from '../auth/oauth.js';
 
-// Jobber rejects unknown versions with a 404, so this must track a version they
-// still publish. Kept in sync with patcher-api's provider client.
-const DEFAULT_GRAPHQL_VERSION = '2025-01-20';
+// Jobber does NOT reject an unknown version — it silently falls back to a
+// long-deprecated one (2022-09-01) and only reports that in
+// `extensions.versioning`. So a typo here degrades quietly rather than failing
+// loudly. 2025-01-20 was a real version but already past end-of-support.
+// `npm run schema:fetch` asserts the served version matches this one.
+const DEFAULT_GRAPHQL_VERSION = '2026-07-27';
 
 export class JobberClient {
   private apiUrl: string;
@@ -203,12 +206,16 @@ export class JobberClient {
   static get clientFields(): string {
     return `
       id
+      name
       firstName
       lastName
       companyName
       email
       phone
       isArchived
+      isCompany
+      isLead
+      balance
       createdAt
       updatedAt
       billingAddress {
@@ -230,17 +237,20 @@ export class JobberClient {
       id
       jobNumber
       title
-      description
-      status
+      instructions
+      jobStatus
+      jobType
+      billingType
       createdAt
       updatedAt
-      closedAt
+      startAt
+      endAt
+      completedAt
+      total
+      invoicedTotal
+      uninvoicedTotal
       client {
         ${this.clientFields}
-      }
-      total {
-        amount
-        currency
       }
     `;
   }
@@ -253,17 +263,24 @@ export class JobberClient {
       id
       quoteNumber
       title
-      status
+      message
+      quoteStatus
       createdAt
+      updatedAt
       sentAt
-      approvedAt
-      expiresAt
+      transitionedAt
+      clientHubViewedAt
+      depositCollected
       client {
         ${this.clientFields}
       }
-      total {
-        amount
-        currency
+      amounts {
+        subtotal
+        discountAmount
+        nonTaxAmount
+        taxAmount
+        depositAmount
+        total
       }
     `;
   }
@@ -276,28 +293,25 @@ export class JobberClient {
       id
       invoiceNumber
       subject
-      status
+      message
+      invoiceStatus
       createdAt
-      sentAt
+      updatedAt
+      issuedDate
       dueDate
+      receivedDate
       client {
         ${this.clientFields}
       }
-      subtotal {
-        amount
-        currency
-      }
-      total {
-        amount
-        currency
-      }
-      amountPaid {
-        amount
-        currency
-      }
-      amountDue {
-        amount
-        currency
+      amounts {
+        subtotal
+        discountAmount
+        nonTaxAmount
+        taxAmount
+        depositAmount
+        paymentsTotal
+        invoiceBalance
+        total
       }
     `;
   }
@@ -309,16 +323,26 @@ export class JobberClient {
     return `
       id
       title
+      instructions
       startAt
       endAt
-      status
+      duration
+      allDay
+      visitStatus
+      isComplete
       completedAt
-      notes
+      createdAt
     `;
   }
 
   /**
-   * Standard line item fields fragment
+   * Standard line item fields fragment.
+   *
+   * There is no `LineItem` type — Jobber models them per parent as
+   * JobLineItem / QuoteLineItem / InvoiceLineItem. These are the fields common
+   * to all three, so one fragment stays valid on any of them. Anything
+   * parent-specific (markup, optional, sortOrder on quotes; taxRate, date on
+   * invoices) has to be selected at the call site.
    */
   static get lineItemFields(): string {
     return `
@@ -326,14 +350,13 @@ export class JobberClient {
       name
       description
       quantity
-      unitPrice {
-        amount
-        currency
-      }
-      total {
-        amount
-        currency
-      }
+      qty
+      unitPrice
+      totalPrice
+      cost
+      taxable
+      createdAt
+      updatedAt
     `;
   }
 
@@ -343,11 +366,26 @@ export class JobberClient {
   static get userFields(): string {
     return `
       id
-      firstName
-      lastName
-      email
-      role
-      isActive
+      uuid
+      name {
+        first
+        last
+        full
+      }
+      email {
+        raw
+        isValid
+      }
+      phone {
+        raw
+        friendly
+      }
+      status
+      isAccountAdmin
+      isAccountOwner
+      availableForScheduling
+      lastLoginAt
+      createdAt
     `;
   }
 }

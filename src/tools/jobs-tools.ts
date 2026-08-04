@@ -1,53 +1,110 @@
 /**
  * Jobs Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27. Notable shape differences from a
+ * naive reading of the API:
+ *   - IDs are `EncodedId`, not `ID`.
+ *   - Job status enum values are lowercase (`active`, not `ACTIVE`).
+ *   - `jobs` has no clientId filter; scope by client via `client { jobs }`.
+ *   - `jobClose` requires an explicit decision about incomplete visits.
  */
 
 import { z } from 'zod';
 import { JobberClient } from '../clients/jobber.js';
-import type { Job, Visit, LineItem } from '../types/jobber.js';
+
+/** JobStatusTypeEnum, verbatim. */
+const JOB_STATUS = [
+  'requires_invoicing', 'archived', 'late', 'today', 'upcoming',
+  'action_required', 'on_hold', 'unscheduled', 'active',
+  'expiring_within_30_days',
+] as const;
+
+const PAGE_INFO = `
+  pageInfo {
+    hasNextPage
+    endCursor
+  }
+  totalCount
+`;
+
+const USER_ERRORS = `
+  userErrors {
+    message
+    path
+  }
+`;
+
+/** Split an ISO 8601 instant into Jobber's LocalDateTimeAttributes. */
+function toLocalDateTime(iso: string, timezone: string) {
+  const [date, rest] = iso.split('T');
+  const time = rest ? rest.replace(/(Z|[+-]\d{2}:?\d{2})$/, '') : undefined;
+  return { date, time, timezone };
+}
 
 export const jobsTools = {
   list_jobs: {
-    description: 'List all jobs with optional filtering and pagination',
+    description:
+      'List jobs with optional filtering and pagination. Filtering by client is supported and is routed through the client record, since the jobs query itself has no client filter.',
     inputSchema: z.object({
-      status: z.enum(['ACTION_REQUIRED', 'ACTIVE', 'CANCELLED', 'COMPLETED', 'LATE', 'REQUIRES_INVOICING']).optional(),
+      status: z.enum(JOB_STATUS).optional(),
+      jobType: z.enum(['ONE_OFF', 'RECURRING']).optional(),
       clientId: z.string().optional(),
+      searchTerm: z.string().optional(),
       limit: z.number().default(50),
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filterConditions: string[] = [];
-      if (args.status) {
-        filterConditions.push(`status: ${args.status}`);
-      }
-      if (args.clientId) {
-        filterConditions.push(`clientId: "${args.clientId}"`);
-      }
+      const filter: Record<string, unknown> = {};
+      if (args.status) filter.status = args.status;
+      if (args.jobType) filter.jobType = args.jobType;
 
-      const filters = filterConditions.length > 0 ? `, filter: { ${filterConditions.join(', ')} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
+      // The `jobs` root query cannot filter by client, so scope through the
+      // client record when a clientId is supplied.
+      if (args.clientId) {
+        const query = `
+          query ListClientJobs($clientId: EncodedId!, $first: Int, $after: String, $filter: JobFilterAttributes) {
+            client(id: $clientId) {
+              jobs(first: $first, after: $after, filter: $filter) {
+                nodes {
+                  ${JobberClient.jobFields}
+                }
+                ${PAGE_INFO}
+              }
+            }
+          }
+        `;
+        const data = await client.query(query, {
+          clientId: args.clientId,
+          first: args.limit,
+          after: args.cursor,
+          filter,
+        });
+        return {
+          jobs: data.client?.jobs?.nodes ?? [],
+          pageInfo: data.client?.jobs?.pageInfo,
+          totalCount: data.client?.jobs?.totalCount,
+        };
+      }
 
       const query = `
-        query ListJobs {
-          jobs(first: ${args.limit}${afterClause}${filters}) {
-            edges {
-              node {
-                ${JobberClient.jobFields}
-              }
-              cursor
+        query ListJobs($first: Int, $after: String, $filter: JobFilterAttributes, $searchTerm: String) {
+          jobs(first: $first, after: $after, filter: $filter, searchTerm: $searchTerm) {
+            nodes {
+              ${JobberClient.jobFields}
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+        searchTerm: args.searchTerm,
+      });
       return {
-        jobs: data.jobs.edges.map((e: any) => e.node),
+        jobs: data.jobs.nodes,
         pageInfo: data.jobs.pageInfo,
         totalCount: data.jobs.totalCount,
       };
@@ -61,7 +118,7 @@ export const jobsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetJob($id: ID!) {
+        query GetJob($id: EncodedId!) {
           job(id: $id) {
             ${JobberClient.jobFields}
           }
@@ -74,34 +131,49 @@ export const jobsTools = {
   },
 
   create_job: {
-    description: 'Create a new job',
+    description:
+      'Create a new job. Jobber derives the client from the property, so propertyId is required and there is no clientId field.',
     inputSchema: z.object({
-      title: z.string(),
-      description: z.string().optional(),
-      clientId: z.string(),
-      propertyId: z.string().optional(),
+      propertyId: z.string().describe("The client property the job is for; determines the job's client"),
+      title: z.string().optional(),
+      instructions: z.string().optional(),
+      jobNumber: z.number().optional(),
+      quoteId: z.string().optional(),
+      requestId: z.string().optional(),
+      salespersonId: z.string().optional(),
+      // JobCreateAttributes.invoicing is non-null, so Jobber rejects a create
+      // without it. Defaulted rather than made required, since these two values
+      // are the common case and forcing every caller to supply them is noise.
+      invoicingType: z.enum(['FIXED_PRICE', 'VISIT_BASED']).default('FIXED_PRICE'),
+      invoicingSchedule: z
+        .enum(['ON_COMPLETION', 'PERIODIC', 'PER_VISIT', 'NEVER'])
+        .default('ON_COMPLETION'),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CreateJob($input: JobInput!) {
+        mutation CreateJob($input: JobCreateAttributes!) {
           jobCreate(input: $input) {
             job {
               ${JobberClient.jobFields}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = {
-        title: args.title,
-        description: args.description,
-        clientId: args.clientId,
+      const input: Record<string, unknown> = {
         propertyId: args.propertyId,
+        invoicing: {
+          invoicingType: args.invoicingType,
+          invoicingSchedule: args.invoicingSchedule,
+        },
       };
+      if (args.title) input.title = args.title;
+      if (args.instructions) input.instructions = args.instructions;
+      if (args.jobNumber) input.jobNumber = args.jobNumber;
+      if (args.quoteId) input.quoteId = args.quoteId;
+      if (args.requestId) input.requestId = args.requestId;
+      if (args.salespersonId) input.salespersonId = args.salespersonId;
 
       const data = await client.mutate(mutation, { input });
 
@@ -118,57 +190,63 @@ export const jobsTools = {
     inputSchema: z.object({
       jobId: z.string(),
       title: z.string().optional(),
-      description: z.string().optional(),
+      instructions: z.string().optional(),
+      jobNumber: z.number().optional(),
+      salespersonId: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation UpdateJob($id: ID!, $input: JobUpdateInput!) {
-          jobUpdate(id: $id, input: $input) {
+        mutation UpdateJob($jobId: EncodedId!, $input: JobEditInput!) {
+          jobEdit(jobId: $jobId, input: $input) {
             job {
               ${JobberClient.jobFields}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input: any = {};
+      const input: Record<string, unknown> = {};
       if (args.title) input.title = args.title;
-      if (args.description) input.description = args.description;
+      if (args.instructions) input.instructions = args.instructions;
+      if (args.jobNumber) input.jobNumber = args.jobNumber;
+      if (args.salespersonId) input.salespersonId = args.salespersonId;
 
-      const data = await client.mutate(mutation, { id: args.jobId, input });
+      const data = await client.mutate(mutation, { jobId: args.jobId, input });
 
-      if (data.jobUpdate.userErrors?.length > 0) {
-        throw new Error(`Job update failed: ${data.jobUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.jobEdit.userErrors?.length > 0) {
+        throw new Error(`Job update failed: ${data.jobEdit.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { job: data.jobUpdate.job };
+      return { job: data.jobEdit.job };
     },
   },
 
   close_job: {
-    description: 'Close a job (mark as completed)',
+    description:
+      'Close a job. Closing forces a decision about visits that are still incomplete: destroy them all, or keep past ones and destroy future ones.',
     inputSchema: z.object({
       jobId: z.string(),
+      modifyIncompleteVisitsBy: z
+        .enum(['DESTROY_ALL', 'COMPLETE_PAST_DESTROY_FUTURE'])
+        .default('COMPLETE_PAST_DESTROY_FUTURE'),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CloseJob($id: ID!) {
-          jobClose(id: $id) {
+        mutation CloseJob($jobId: EncodedId!, $input: JobCloseInput!) {
+          jobClose(jobId: $jobId, input: $input) {
             job {
               ${JobberClient.jobFields}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const data = await client.mutate(mutation, { id: args.jobId });
+      const data = await client.mutate(mutation, {
+        jobId: args.jobId,
+        input: { modifyIncompleteVisitsBy: args.modifyIncompleteVisitsBy },
+      });
 
       if (data.jobClose.userErrors?.length > 0) {
         throw new Error(`Job close failed: ${data.jobClose.userErrors.map((e: any) => e.message).join(', ')}`);
@@ -178,65 +256,113 @@ export const jobsTools = {
     },
   },
 
+  reopen_job: {
+    description: 'Reopen a previously closed job',
+    inputSchema: z.object({
+      jobId: z.string(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation ReopenJob($jobId: EncodedId!) {
+          jobReopen(jobId: $jobId) {
+            job {
+              ${JobberClient.jobFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, { jobId: args.jobId });
+
+      if (data.jobReopen.userErrors?.length > 0) {
+        throw new Error(`Job reopen failed: ${data.jobReopen.userErrors.map((e: any) => e.message).join(', ')}`);
+      }
+
+      return { job: data.jobReopen.job };
+    },
+  },
+
   list_job_visits: {
     description: 'List all visits for a specific job',
     inputSchema: z.object({
       jobId: z.string(),
+      limit: z.number().default(50),
+      cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetJobVisits($id: ID!) {
+        query GetJobVisits($id: EncodedId!, $first: Int, $after: String) {
           job(id: $id) {
-            visits {
-              ${JobberClient.visitFields}
+            visits(first: $first, after: $after) {
+              nodes {
+                ${JobberClient.visitFields}
+              }
+              ${PAGE_INFO}
             }
           }
         }
       `;
 
-      const data = await client.query(query, { id: args.jobId });
-      return { visits: data.job.visits };
+      const data = await client.query(query, {
+        id: args.jobId,
+        first: args.limit,
+        after: args.cursor,
+      });
+      return {
+        visits: data.job?.visits?.nodes ?? [],
+        pageInfo: data.job?.visits?.pageInfo,
+        totalCount: data.job?.visits?.totalCount,
+      };
     },
   },
 
   create_job_visit: {
-    description: 'Create a new visit for a job',
+    description:
+      'Create one or more visits on a job. Jobber schedules visits with a local date/time plus timezone rather than a UTC instant.',
     inputSchema: z.object({
       jobId: z.string(),
-      title: z.string(),
-      startAt: z.string().describe('ISO 8601 datetime'),
-      endAt: z.string().describe('ISO 8601 datetime'),
-      userIds: z.array(z.string()).optional(),
+      title: z.string().optional(),
+      instructions: z.string().optional(),
+      startAt: z.string().describe('ISO 8601 datetime, e.g. 2026-03-01T09:00:00'),
+      endAt: z.string().optional().describe('ISO 8601 datetime'),
+      timezone: z.string().default('UTC').describe('IANA timezone, e.g. America/Denver'),
+      assignedUserIds: z.array(z.string()).optional(),
+      notifyTeam: z.boolean().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CreateVisit($input: VisitInput!) {
-          visitCreate(input: $input) {
-            visit {
+        mutation CreateVisit($jobId: EncodedId!, $input: VisitCreateInput!) {
+          visitCreate(jobId: $jobId, input: $input) {
+            createdVisits {
               ${JobberClient.visitFields}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = {
-        jobId: args.jobId,
-        title: args.title,
-        startAt: args.startAt,
-        endAt: args.endAt,
-        userIds: args.userIds,
+      const schedule: Record<string, unknown> = {
+        startAt: toLocalDateTime(args.startAt, args.timezone),
       };
+      if (args.endAt) schedule.endAt = toLocalDateTime(args.endAt, args.timezone);
+      if (args.assignedUserIds) schedule.teamMemberIdsToAssign = args.assignedUserIds;
+      if (args.notifyTeam !== undefined) schedule.notifyTeam = args.notifyTeam;
 
-      const data = await client.mutate(mutation, { input });
+      const visit: Record<string, unknown> = { schedule };
+      if (args.title) visit.title = args.title;
+      if (args.instructions) visit.instructions = args.instructions;
+
+      const data = await client.mutate(mutation, {
+        jobId: args.jobId,
+        input: { visits: [visit] },
+      });
 
       if (data.visitCreate.userErrors?.length > 0) {
         throw new Error(`Visit creation failed: ${data.visitCreate.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { visit: data.visitCreate.visit };
+      return { visits: data.visitCreate.createdVisits };
     },
   },
 
@@ -244,80 +370,33 @@ export const jobsTools = {
     description: 'List all line items for a specific job',
     inputSchema: z.object({
       jobId: z.string(),
+      limit: z.number().default(50),
+      cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetJobLineItems($id: ID!) {
+        query GetJobLineItems($id: EncodedId!, $first: Int, $after: String) {
           job(id: $id) {
-            lineItems {
-              ${JobberClient.lineItemFields}
+            lineItems(first: $first, after: $after) {
+              nodes {
+                ${JobberClient.lineItemFields}
+              }
+              ${PAGE_INFO}
             }
           }
         }
       `;
 
-      const data = await client.query(query, { id: args.jobId });
-      return { lineItems: data.job.lineItems };
-    },
-  },
-
-  complete_job: {
-    description: 'Mark a job as complete (closes the job)',
-    inputSchema: z.object({
-      jobId: z.string().describe('The job ID to complete'),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation CompleteJob($id: ID!) {
-          jobClose(id: $id) {
-            job {
-              ${JobberClient.jobFields}
-            }
-            userErrors {
-              message
-              path
-            }
-          }
-        }
-      `;
-
-      const data = await client.mutate(mutation, { id: args.jobId });
-
-      if (data.jobClose.userErrors?.length > 0) {
-        throw new Error(`Job complete failed: ${data.jobClose.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { job: data.jobClose.job };
-    },
-  },
-
-  archive_job: {
-    description: 'Archive a job (removes it from active job list)',
-    inputSchema: z.object({
-      jobId: z.string().describe('The job ID to archive'),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation ArchiveJob($id: ID!) {
-          jobArchive(id: $id) {
-            job {
-              ${JobberClient.jobFields}
-            }
-            userErrors {
-              message
-              path
-            }
-          }
-        }
-      `;
-
-      const data = await client.mutate(mutation, { id: args.jobId });
-
-      if (data.jobArchive.userErrors?.length > 0) {
-        throw new Error(`Job archive failed: ${data.jobArchive.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { job: data.jobArchive.job };
+      const data = await client.query(query, {
+        id: args.jobId,
+        first: args.limit,
+        after: args.cursor,
+      });
+      return {
+        lineItems: data.job?.lineItems?.nodes ?? [],
+        pageInfo: data.job?.lineItems?.pageInfo,
+        totalCount: data.job?.lineItems?.totalCount,
+      };
     },
   },
 };

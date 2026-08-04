@@ -1,348 +1,49 @@
 /**
  * Forms Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27.
+ *
+ * INVESTIGATION RESULT: this module is intentionally EMPTY. Jobber's public
+ * API does not expose "Form" as a queryable resource at all:
+ *   - Query root has no `forms`, `form`, `formSubmissions`, or
+ *     `formSubmission` field. (Confirmed against the full list of Query
+ *     root fields in schema/jobber-schema.graphql / jobber-schema.json —
+ *     nothing form-related exists there.)
+ *   - Mutation root has no `formCreate`, `formUpdate`, `formDelete`, or
+ *     `formSubmissionCreate`. There is no way to define a form or record a
+ *     submission through this API.
+ *   - `Job.jobFormIds` and `JobEditInput.jobFormIds` / the identically named
+ *     field on `JobCreateAttributes` are WRITE-ONLY: they exist on the
+ *     create/edit input types, but `type Job` itself has no `jobFormIds` (or
+ *     any other forms-related) field to read them back.
+ *   - The one real forms-adjacent capability is the mutation
+ *     `requestEditJobForms(requestId: EncodedId!, input: FormAttachmentInput)`,
+ *     which attaches/detaches form TEMPLATE ids (`FormAttachmentInput { formIds:
+ *     [EncodedId!]! }`) on a Request. It is entirely write-only and blind:
+ *     there is no query anywhere in the schema that lists form templates, so
+ *     a caller has no way to discover which `EncodedId`s are valid, and no
+ *     way to read back what's currently attached to a request or job. `Visit`
+ *     exposes `incompleteJobFormsCount: Int!`, a bare count with no
+ *     supporting detail.
+ *   - `RequestDetailsInput.form: FormInput!` (nested `FormSectionInput` /
+ *     `FormItemInput`) lets an external app attach freeform Q&A answers when
+ *     creating a Request via `requestCreate`, but this is a Request-creation
+ *     concern (owned by requests-tools.ts), not a standalone forms resource,
+ *     and again has no corresponding read path.
+ *
+ * Net result: there is no read path for forms anywhere in the schema, which
+ * was the bar set for keeping this module alive. Every tool that used to
+ * live here (list_forms, get_form, create_form, update_form, delete_form,
+ * submit_form, list_form_submissions, get_form_submission) called
+ * queries/mutations that do not exist and has been deleted rather than kept
+ * around throwing a "not supported" error at runtime.
+ *
+ * If Jobber's API ever adds a real forms query surface, or if
+ * `requestEditJobForms` should be exposed despite being blind/write-only,
+ * reintroduce tools here against the real schema.
  */
 
-import { z } from 'zod';
-import { JobberClient } from '../clients/jobber.js';
-
-export interface Form {
-  id: string;
-  name: string;
-  description?: string;
-  fields: FormField[];
-  isActive: boolean;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface FormField {
-  id: string;
-  label: string;
-  type: 'text' | 'textarea' | 'number' | 'date' | 'checkbox' | 'select' | 'signature';
-  required: boolean;
-  options?: string[];
-}
-
-export interface FormSubmission {
-  id: string;
-  formId: string;
-  jobId?: string;
-  visitId?: string;
-  submittedBy: string;
-  submittedAt: string;
-  data: Record<string, any>;
-}
-
-export const formsTools = {
-  list_forms: {
-    description: 'List all custom forms',
-    inputSchema: z.object({
-      isActive: z.boolean().optional(),
-      limit: z.number().default(50),
-      cursor: z.string().optional(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const filterClause = args.isActive !== undefined ? `, filter: { isActive: ${args.isActive} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
-
-      const query = `
-        query ListForms {
-          forms(first: ${args.limit}${afterClause}${filterClause}) {
-            edges {
-              node {
-                id
-                name
-                description
-                isActive
-                createdAt
-                updatedAt
-                fields {
-                  id
-                  label
-                  type
-                  required
-                  options
-                }
-              }
-              cursor
-            }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-          }
-        }
-      `;
-
-      const data = await client.query(query);
-      return {
-        forms: data.forms.edges.map((e: any) => e.node),
-        pageInfo: data.forms.pageInfo,
-      };
-    },
-  },
-
-  get_form: {
-    description: 'Get a specific form by ID',
-    inputSchema: z.object({
-      formId: z.string(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const query = `
-        query GetForm($id: ID!) {
-          form(id: $id) {
-            id
-            name
-            description
-            isActive
-            createdAt
-            updatedAt
-            fields {
-              id
-              label
-              type
-              required
-              options
-            }
-          }
-        }
-      `;
-
-      const data = await client.query(query, { id: args.formId });
-      return { form: data.form };
-    },
-  },
-
-  create_form: {
-    description: 'Create a new custom form',
-    inputSchema: z.object({
-      name: z.string(),
-      description: z.string().optional(),
-      fields: z.array(z.object({
-        label: z.string(),
-        type: z.enum(['text', 'textarea', 'number', 'date', 'checkbox', 'select', 'signature']),
-        required: z.boolean().default(false),
-        options: z.array(z.string()).optional(),
-      })),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation CreateForm($input: FormInput!) {
-          formCreate(input: $input) {
-            form {
-              id
-              name
-              description
-              isActive
-              fields {
-                id
-                label
-                type
-                required
-                options
-              }
-            }
-            userErrors {
-              message
-            }
-          }
-        }
-      `;
-
-      const input = {
-        name: args.name,
-        description: args.description,
-        fields: args.fields,
-      };
-
-      const data = await client.mutate(mutation, { input });
-
-      if (data.formCreate.userErrors?.length > 0) {
-        throw new Error(`Form creation failed: ${data.formCreate.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { form: data.formCreate.form };
-    },
-  },
-
-  update_form: {
-    description: 'Update an existing form',
-    inputSchema: z.object({
-      formId: z.string(),
-      name: z.string().optional(),
-      description: z.string().optional(),
-      isActive: z.boolean().optional(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation UpdateForm($id: ID!, $input: FormUpdateInput!) {
-          formUpdate(id: $id, input: $input) {
-            form {
-              id
-              name
-              description
-              isActive
-            }
-            userErrors {
-              message
-            }
-          }
-        }
-      `;
-
-      const input: any = {};
-      if (args.name) input.name = args.name;
-      if (args.description) input.description = args.description;
-      if (args.isActive !== undefined) input.isActive = args.isActive;
-
-      const data = await client.mutate(mutation, { id: args.formId, input });
-
-      if (data.formUpdate.userErrors?.length > 0) {
-        throw new Error(`Form update failed: ${data.formUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { form: data.formUpdate.form };
-    },
-  },
-
-  delete_form: {
-    description: 'Delete a form',
-    inputSchema: z.object({
-      formId: z.string(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation DeleteForm($id: ID!) {
-          formDelete(id: $id) {
-            deletedFormId
-            userErrors {
-              message
-            }
-          }
-        }
-      `;
-
-      const data = await client.mutate(mutation, { id: args.formId });
-
-      if (data.formDelete.userErrors?.length > 0) {
-        throw new Error(`Form deletion failed: ${data.formDelete.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { deletedFormId: data.formDelete.deletedFormId };
-    },
-  },
-
-  submit_form: {
-    description: 'Submit a form with data',
-    inputSchema: z.object({
-      formId: z.string(),
-      jobId: z.string().optional(),
-      visitId: z.string().optional(),
-      data: z.record(z.any()),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation SubmitForm($input: FormSubmissionInput!) {
-          formSubmissionCreate(input: $input) {
-            formSubmission {
-              id
-              formId
-              submittedAt
-              data
-            }
-            userErrors {
-              message
-            }
-          }
-        }
-      `;
-
-      const input = {
-        formId: args.formId,
-        jobId: args.jobId,
-        visitId: args.visitId,
-        data: args.data,
-      };
-
-      const data = await client.mutate(mutation, { input });
-
-      if (data.formSubmissionCreate.userErrors?.length > 0) {
-        throw new Error(`Form submission failed: ${data.formSubmissionCreate.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { formSubmission: data.formSubmissionCreate.formSubmission };
-    },
-  },
-
-  list_form_submissions: {
-    description: 'List submissions for a form',
-    inputSchema: z.object({
-      formId: z.string().optional(),
-      jobId: z.string().optional(),
-      visitId: z.string().optional(),
-      limit: z.number().default(50),
-      cursor: z.string().optional(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const filters: string[] = [];
-      if (args.formId) filters.push(`formId: "${args.formId}"`);
-      if (args.jobId) filters.push(`jobId: "${args.jobId}"`);
-      if (args.visitId) filters.push(`visitId: "${args.visitId}"`);
-
-      const filterClause = filters.length > 0 ? `, filter: { ${filters.join(', ')} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
-
-      const query = `
-        query ListFormSubmissions {
-          formSubmissions(first: ${args.limit}${afterClause}${filterClause}) {
-            edges {
-              node {
-                id
-                formId
-                jobId
-                visitId
-                submittedAt
-                data
-              }
-              cursor
-            }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-          }
-        }
-      `;
-
-      const data = await client.query(query);
-      return {
-        submissions: data.formSubmissions.edges.map((e: any) => e.node),
-        pageInfo: data.formSubmissions.pageInfo,
-      };
-    },
-  },
-
-  get_form_submission: {
-    description: 'Get a specific form submission',
-    inputSchema: z.object({
-      submissionId: z.string(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const query = `
-        query GetFormSubmission($id: ID!) {
-          formSubmission(id: $id) {
-            id
-            formId
-            jobId
-            visitId
-            submittedAt
-            data
-          }
-        }
-      `;
-
-      const data = await client.query(query, { id: args.submissionId });
-      return { submission: data.formSubmission };
-    },
-  },
-};
+// Intentionally empty: see module doc comment above. Exported as an object
+// so `src/server.ts`'s `...formsTools` spread keeps compiling; there is
+// nothing to register.
+export const formsTools = {};

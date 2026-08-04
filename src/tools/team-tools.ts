@@ -1,43 +1,87 @@
 /**
  * Team Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27. Notable shape differences from a
+ * naive reading of the API:
+ *   - IDs are `EncodedId`; `user(id:)` takes a nullable `EncodedId`.
+ *   - `User` has no firstName/lastName/role/isActive — see
+ *     `JobberClient.userFields` for the real shape (`name { first last full }`,
+ *     `email { raw isValid }`, `status`, etc).
+ *   - `UsersFilterAttributes.status` (`UsersStatusFilterEnum`) is required
+ *     *within* the filter object and there is no `isActive`, so this tool now
+ *     exposes `status` and only sends a filter at all when one is given (the
+ *     root `filter` argument itself stays optional).
+ *   - The root time-entry query is `timeSheetEntries`, not `timeEntries`, and
+ *     `TimeSheetEntriesFilterAttributes` has no `visitId` field — scoping to a
+ *     visit goes through `visit(id:) { timeSheetEntries }` instead.
+ *   - There is no mutation to create a time sheet entry anywhere in the
+ *     schema (no `timeSheetEntryCreate`/`timeEntryCreate` — entries come from
+ *     starting/stopping timers, which isn't exposed as a direct create
+ *     mutation), so `create_team_time_entry` has been removed; see the note
+ *     below.
+ *   - Only `userEdit` exists for users — there is no userCreate/userDelete.
  */
 
 import { z } from 'zod';
 import { JobberClient } from '../clients/jobber.js';
 
+/** UsersStatusFilterEnum, verbatim. */
+const USER_STATUS = ['ACTIVATED', 'DEACTIVATED'] as const;
+
+const PAGE_INFO = `
+  pageInfo {
+    hasNextPage
+    endCursor
+  }
+  totalCount
+`;
+
+/** Fields common to a TimeSheetEntry, whether fetched root-level or via a visit. */
+const TIME_SHEET_ENTRY_FIELDS = `
+  id
+  startAt
+  endAt
+  finalDuration
+  note
+  user {
+    ${JobberClient.userFields}
+  }
+  job {
+    id
+    jobNumber
+    title
+  }
+`;
+
 export const teamTools = {
   list_users: {
-    description: 'List all users in the organization',
+    description: 'List all users in the organization, optionally filtered by activation status',
     inputSchema: z.object({
-      isActive: z.boolean().optional(),
+      status: z.enum(USER_STATUS).optional().describe('ACTIVATED or DEACTIVATED'),
       limit: z.number().default(50),
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filters = args.isActive !== undefined ? `, filter: { isActive: ${args.isActive} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
+      const filter = args.status ? { status: args.status } : undefined;
 
       const query = `
-        query ListUsers {
-          users(first: ${args.limit}${afterClause}${filters}) {
-            edges {
-              node {
-                ${JobberClient.userFields}
-              }
-              cursor
+        query ListUsers($first: Int, $after: String, $filter: UsersFilterAttributes) {
+          users(first: $first, after: $after, filter: $filter) {
+            nodes {
+              ${JobberClient.userFields}
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+      });
       return {
-        users: data.users.edges.map((e: any) => e.node),
+        users: data.users.nodes,
         pageInfo: data.users.pageInfo,
         totalCount: data.users.totalCount,
       };
@@ -51,7 +95,7 @@ export const teamTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetUser($id: ID!) {
+        query GetUser($id: EncodedId) {
           user(id: $id) {
             ${JobberClient.userFields}
           }
@@ -64,117 +108,73 @@ export const teamTools = {
   },
 
   list_team_time_entries: {
-    description: 'List time entries for team members with optional filtering',
+    description:
+      'List time sheet entries. Pass visitId to scope to a single visit (via visit.timeSheetEntries, since the filter has no visitId); otherwise lists from the root timeSheetEntries query, optionally filtered by assigned user and a startAt date range.',
     inputSchema: z.object({
-      userId: z.string().optional(),
-      visitId: z.string().optional(),
-      startDate: z.string().optional().describe('ISO 8601 date'),
-      endDate: z.string().optional().describe('ISO 8601 date'),
+      userId: z.string().optional().describe('Filter to entries assigned to this user'),
+      visitId: z.string().optional().describe('List entries for this visit instead of the org-wide query'),
+      startDate: z.string().optional().describe('ISO 8601 datetime — lower bound for startAt'),
+      endDate: z.string().optional().describe('ISO 8601 datetime — upper bound for startAt'),
       limit: z.number().default(50),
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filterConditions: string[] = [];
-      if (args.userId) {
-        filterConditions.push(`userId: "${args.userId}"`);
-      }
       if (args.visitId) {
-        filterConditions.push(`visitId: "${args.visitId}"`);
-      }
-      if (args.startDate) {
-        filterConditions.push(`startDate: "${args.startDate}"`);
-      }
-      if (args.endDate) {
-        filterConditions.push(`endDate: "${args.endDate}"`);
+        const query = `
+          query GetVisitTimeSheetEntries($id: EncodedId!, $first: Int, $after: String) {
+            visit(id: $id) {
+              timeSheetEntries(first: $first, after: $after) {
+                nodes {
+                  ${TIME_SHEET_ENTRY_FIELDS}
+                }
+                ${PAGE_INFO}
+              }
+            }
+          }
+        `;
+
+        const data = await client.query(query, {
+          id: args.visitId,
+          first: args.limit,
+          after: args.cursor,
+        });
+        return {
+          timeEntries: data.visit?.timeSheetEntries?.nodes ?? [],
+          pageInfo: data.visit?.timeSheetEntries?.pageInfo,
+          totalCount: data.visit?.timeSheetEntries?.totalCount,
+        };
       }
 
-      const filters = filterConditions.length > 0 ? `, filter: { ${filterConditions.join(', ')} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
+      const filter: Record<string, unknown> = {};
+      if (args.userId) filter.assignedTo = args.userId;
+      if (args.startDate || args.endDate) {
+        filter.startAt = {
+          after: args.startDate,
+          before: args.endDate,
+        };
+      }
 
       const query = `
-        query ListTimeEntries {
-          timeEntries(first: ${args.limit}${afterClause}${filters}) {
-            edges {
-              node {
-                id
-                startAt
-                endAt
-                duration
-                notes
-                user {
-                  ${JobberClient.userFields}
-                }
-                visit {
-                  id
-                  title
-                }
-              }
-              cursor
+        query ListTimeSheetEntries($first: Int, $after: String, $filter: TimeSheetEntriesFilterAttributes) {
+          timeSheetEntries(first: $first, after: $after, filter: $filter) {
+            nodes {
+              ${TIME_SHEET_ENTRY_FIELDS}
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+      });
       return {
-        timeEntries: data.timeEntries.edges.map((e: any) => e.node),
-        pageInfo: data.timeEntries.pageInfo,
-        totalCount: data.timeEntries.totalCount,
+        timeEntries: data.timeSheetEntries.nodes,
+        pageInfo: data.timeSheetEntries.pageInfo,
+        totalCount: data.timeSheetEntries.totalCount,
       };
-    },
-  },
-
-  create_team_time_entry: {
-    description: 'Create a new time entry for a team member',
-    inputSchema: z.object({
-      userId: z.string(),
-      visitId: z.string().optional(),
-      startAt: z.string().describe('ISO 8601 datetime'),
-      endAt: z.string().optional().describe('ISO 8601 datetime'),
-      notes: z.string().optional(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation CreateTimeEntry($input: TimeEntryInput!) {
-          timeEntryCreate(input: $input) {
-            timeEntry {
-              id
-              startAt
-              endAt
-              duration
-              notes
-              user {
-                ${JobberClient.userFields}
-              }
-            }
-            userErrors {
-              message
-              path
-            }
-          }
-        }
-      `;
-
-      const input = {
-        userId: args.userId,
-        visitId: args.visitId,
-        startAt: args.startAt,
-        endAt: args.endAt,
-        notes: args.notes,
-      };
-
-      const data = await client.mutate(mutation, { input });
-
-      if (data.timeEntryCreate.userErrors?.length > 0) {
-        throw new Error(`Time entry creation failed: ${data.timeEntryCreate.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { timeEntry: data.timeEntryCreate.timeEntry };
     },
   },
 };

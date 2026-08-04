@@ -7,7 +7,7 @@ account unless explicitly marked otherwise.
 
 ## 1. What this is
 
-An MCP server exposing **102 tools** over Jobber's GraphQL API (15 tool modules
+An MCP server exposing **73 tools** over Jobber's GraphQL API (15 tool modules
 under `src/tools/`). It ships two transports:
 
 | Transport | Entry point | Use |
@@ -19,22 +19,23 @@ It is **single-tenant**. Every caller acts as the one Jobber account the server
 is authorized against. This is an access gate for a team that already shares an
 account — not a multi-user system.
 
+> The tool count was 102. It is now 73 because 29 tools called Jobber
+> queries/mutations that do not exist. See §4.
+
 ---
 
 ## 2. Authentication: how Jobber actually works
 
-Jobber issues **no static API keys or personal access tokens**. The README used
-to claim otherwise ("Settings > API Access") — that screen does not exist.
-
-The real model is OAuth 2.0:
+Jobber issues **no static API keys or personal access tokens**. The real model
+is OAuth 2.0:
 
 1. Register an app at [developer.getjobber.com](https://developer.getjobber.com)
    → client ID + secret.
 2. Authorization code grant → access token + refresh token.
 3. **Access tokens expire after 60 minutes.**
-4. **Refresh tokens rotate on every refresh and the old one dies immediately.**
-
-Point 4 drives most of the design below.
+4. **Refresh tokens are single-use.** Concurrent refreshes with the same token
+   fail with `invalid_grant` — this is what the token-store lock in §3 exists
+   to prevent.
 
 ### Bootstrapping
 
@@ -48,13 +49,9 @@ token pair. It accepts either a pasted redirect URL or a bare code, and verifies
 the OAuth `state` parameter.
 
 The `JOBBER_REDIRECT_URI` currently in `.env` is a tunnel hostname that doubles
-as the internal API's OAuth callback. It forwards to that API, so the redirect
-lands on a service which does not understand the code and **the code must be
-pasted in by hand**; the auth code also passes through that service's logs on
-the way. Both are cosmetic, not blocking.
-
-If you ever point the redirect at a loopback URI (or set `JOBBER_CALLBACK_PORT`
-to a port a tunnel forwards to), the CLI captures the code automatically.
+as the internal API's OAuth callback, so **the code must be pasted in by hand**.
+Cosmetic, not blocking. Point the redirect at a loopback URI (or set
+`JOBBER_CALLBACK_PORT`) and the CLI captures the code automatically.
 
 ---
 
@@ -62,149 +59,209 @@ to a port a tunnel forwards to), the CLI captures the code automatically.
 
 **Only one token store may be live per Jobber app.**
 
-You have decided to use a **single Jobber app for both local and team use**.
-That is workable, but it has a hard consequence:
+A single Jobber app backs both local and team use. Consequence:
 
-> Once the hosted server is running, **do not also run the stdio server against
-> the same app.** Each will invalidate the other's refresh token, and recovery
-> means re-running `npm run authorize`.
+> Now that the hosted server is running, **do not also run the stdio server
+> against the same app.** Each will invalidate the other's refresh token, and
+> recovery means re-running `npm run authorize`.
 
-The supported setup under one app:
+The supported setup:
 
 - The hosted HTTP server owns the token chain.
 - Everyone — including you, locally — connects to it over HTTP with the bearer
-  secret. See §6 for client config.
-- Remove any local stdio registration, e.g. a previous
-  `claude mcp add jobber -- node .../dist/index.js` in a sibling repo
-  (`claude mcp remove jobber`).
-
-Use the stdio transport only when the hosted server is not running, or for
-throwaway local work before deploying.
+  secret. See §7.
 
 **Within** a single store, concurrency is safe: `TokenStore` takes an O_EXCL
 lockfile and a process that loses the race re-reads and adopts the winner's
-tokens rather than replaying a spent one. That covers several MCP clients on one
-machine and overlapping containers during a rolling deploy. It cannot coordinate
-two *different* stores — hence the rule above.
+tokens rather than replaying a spent one.
+
+If you need to hit Jobber directly from a script, take the **access** token from
+the deployed container and never the refresh token — that is exactly what
+`scripts/fetch-schema.mjs` and `scripts/live-read-check.mjs` do, and why neither
+accepts a refresh token.
 
 ---
 
-## 4. Three pre-existing bugs fixed
+## 4. The GraphQL API version and schema (read this before touching a tool)
 
-These were all latent before this work; the server had never successfully served
-a tool call to any client.
+### The version trap
 
-1. **`tools/list` returned invalid schemas.** `server.ts` sent
-   `tool.inputSchema.shape` — raw Zod internals — where MCP requires JSON
-   Schema. Every client failed validation on connect with
-   `expected "object"`. Now converted with `zod-to-json-schema` (promoted from a
-   transitive dep to an explicit one).
-2. **`X-JOBBER-GRAPHQL-VERSION: 2024-01-11` did not exist.** Jobber answered
-   every request `404 {"message":"GraphQL API version ... does not exist"}`. Now
-   `2025-01-20`, matching the version our internal Jobber provider uses.
-3. **`JOBBER_OAUTH_URL` was ignored by the server.** Documented and honored by
-   the authorize CLI, but never passed into `JobberClient`, so overrides
-   silently hit production Jobber. Caught by the container test.
+`X-JOBBER-GRAPHQL-VERSION` fails **silently**. An unrecognized version is not
+rejected — Jobber serves `2022-09-01` (long unsupported) and mentions the
+fallback only in `extensions.versioning`. A typo therefore degrades quietly
+instead of erroring.
+
+| Version | Result |
+| --- | --- |
+| `2024-01-11` | not a version; no `versioning` block at all |
+| `2025-01-20` | real, but **past end-of-support**, warns it may vanish without notice |
+| `2026-07-27` | current, no warning — **what we now use** |
+
+`npm run schema:fetch` asserts the served version equals the requested one, so
+this cannot regress unnoticed.
+
+### What was wrong
+
+The tool layer had **never been validated against the schema**. At version
+`2026-07-27`, **2 of 102 tools** produced a valid GraphQL document. Causes, in
+rough order of frequency:
+
+- IDs typed `ID!` where Jobber uses `EncodedId!`
+- Status enum values uppercased (`ACTIVE`) where Jobber uses lowercase (`active`)
+- Entity fields selected directly on a `*Connection` instead of through `nodes`
+- `XUpdate` mutations — Jobber names them `XEdit`, with entity-named ID
+  arguments (`jobId:`, not `id:`)
+- Money selected as `{ amount currency }`; it is a plain `Float`, and
+  quote/invoice totals live under `amounts { … }`
+- Whole feature areas that simply do not exist in the API
+
+### What does not exist in Jobber's API
+
+29 tools were deleted because there is no counterpart at any version:
+
+| Area | Deleted | Why |
+| --- | --- | --- |
+| Forms | all 8 | No `forms`/`form`/`formSubmission*` query and no `form*` mutation. Job forms are not a public API resource. Module is now empty. |
+| Timesheet writes | 4 | `timeSheetEntries` is readable; there is **no** timesheet mutation of any kind. |
+| Tax writes | 5 | No `taxUpdate`/`taxDelete`/`lineItemTaxApply`/`lineItemTaxRemove`/`invoiceOrQuote`. |
+| Quote actions | 3 | No `quoteSend`/`quoteApprove`; approval is a client-hub action. |
+| Payments | 2 | No payment-recording mutation exists. |
+| Request conversion | 2 | No `requestConvertToJob`/`requestConvertToQuote`. |
+| Misc | 5 | `jobArchive`, `propertyDelete`, `set_default_property`, `productArchive`, `approve_expense` — no mutations. |
+
+### Behavior changes worth knowing
+
+- `send_invoice` → `invoiceMarkAsSent`, which takes only an ID; the old custom
+  `message` had nowhere to go.
+- `convert_quote_to_job` rebuilt on `jobCreate` with `quoteId`.
+- `create_job`/`create_quote`/`create_invoice` gained required fields because the
+  API requires them (`JobCreateAttributes.invoicing` is non-null; quotes and
+  invoices require line items).
+- `list_users` now takes `status: ACTIVATED|DEACTIVATED` — the filter's `status`
+  is non-null whenever a filter is supplied.
+- Expense `amount` → `total`; product `unitPrice` → `defaultUnitCost`.
+- Line items have no unified type. `create_line_items`/`edit_line_items`/
+  `delete_line_items` take a `parent` discriminator (`job|quote|visit|request`)
+  and dispatch to the parent-scoped mutation.
+- Reporting has no `reports` query; all 5 tools are client-side aggregations
+  over real queries, and each description states what it actually computes.
 
 ---
 
-## 5. Deploying to the Mac mini (Coolify)
+## 5. Verification: what is proven, and what is not
 
-Modeled on our existing Coolify deployment runbook. `Dockerfile` and
-`docker-compose.yaml` are in this repo.
+Three layers, in increasing strength. **Run them in this order.**
 
-The image is multi-stage (build TS → run `dist/http.js`), runs as non-root on
-port 3000, and healthchecks `/health` using Node 22's built-in fetch.
-
-### Steps
-
-1. Run `npm run authorize` locally for a fresh refresh token.
-2. Generate the shared secret:
-   ```bash
-   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-   ```
-3. Create a Coolify **Dockerfile Application** (not Docker Image — that trap is
-   documented in that runbook), port 3000, health-gated on `/health`,
-   FQDN `http://jobber-mcp.<your-domain>` — **`http` scheme on purpose**,
-   since Cloudflare terminates TLS at the edge and an `https` FQDN makes Traefik
-   redirect-loop behind the tunnel.
-4. Set env vars: `JOBBER_CLIENT_ID`, `JOBBER_CLIENT_SECRET`,
-   `JOBBER_REFRESH_TOKEN`, `JOBBER_MCP_SECRET`.
-5. **Mount a volume at `/data`.** Not optional — without it every redeploy loses
-   the rotated refresh token and someone re-authorizes by hand.
-6. Add the tunnel ingress rule for the new hostname → `coolify-proxy:80` on the
-   existing `cloudflared-tunnel` service.
-7. Deploy. On first boot the server spends the bootstrap token and writes the
-   rotated pair to the volume. From then on **the volume is the source of truth**
-   and the `JOBBER_REFRESH_TOKEN` env value is stale by design — that is correct,
-   not a bug.
-
-### Not done
-
-Steps 3–7 need Coolify/Cloudflare access and have **not** been performed. The
-image build and container runtime were verified locally (see §7).
-
----
-
-## 6. Connecting clients
-
-The server refuses to start without `JOBBER_MCP_SECRET`. That is deliberate: the
-tool set includes `create_job`, `close_job`, `archive_client`, `create_invoice`
-and friends, so an unauthenticated public endpoint would let anyone who finds
-the URL write to the Jobber account.
-
-```json
-"jobber": {
-  "type": "http",
-  "url": "https://jobber-mcp.<your-domain>/mcp",
-  "headers": { "Authorization": "Bearer <JOBBER_MCP_SECRET>" }
-}
+```bash
+npm run schema:fetch      # refresh schema/ from live Jobber (needs an access token)
+npm run validate:graphql  # layer 1
+node scripts/audit-tools.mjs   # layers 1+2+3
 ```
 
-Add to your project's `.mcp.json` (if it is tracked — put the secret in each person's local
-config, not in the committed file) or via
-`claude mcp add --transport http jobber <url> -H "Authorization: Bearer <secret>"`.
+| Layer | Script | Catches |
+| --- | --- | --- |
+| 1. Document | `validate-graphql.mjs` | Fields/args/enums/types that don't exist |
+| 2. Variables | `audit-tools.mjs` | Wrong keys in the variables object — invisible to layer 1 |
+| 3. Response shape | `audit-tools.mjs` | Post-processing that mishandles a schema-shaped response |
+
+Layer 2 matters because `validate(schema, document)` never inspects the
+variables object. A mutation declaring `$input: JobEditInput!` while building
+`{ description }` (the real field is `instructions`) is a **valid document that
+fails at runtime** — the codebase's original bug, relocated. This layer caught
+exactly that in `create_job` (`invoicing` is non-null and was missing).
+
+All three are **fully offline and never send a mutation.**
+
+### Current results
+
+| Check | Result |
+| --- | --- |
+| `tsc --noEmit` | exit 0 |
+| Document validation | **73/73** |
+| Deep audit (documents + variables + response shape) | **73/73** |
+| Live read-only run against real Jobber | **33 passed, 0 failed, 5 skipped** |
+
+The 5 skips are `get_invoice`, `list_invoice_payments`, `get_expense`,
+`get_timesheet_entry`, `get_tax_rate` — the test account holds no invoices,
+expenses, timesheet entries, or tax rates, so no real ID exists to fetch.
+
+### ⚠️ What is still NOT proven
+
+**No mutation has ever been executed against Jobber.** Roughly half the tools
+(every `create_`/`update_`/`delete_`/`archive_`) are verified statically only.
+Static analysis is strong here — it checks the document, the variables, and the
+response handling — but it cannot prove Jobber accepts the write, and it cannot
+catch permission scopes, business-rule rejections, or throttling.
+
+Closing that gap means writing real records into a live Jobber account. Options:
+a separate sandbox account, or production with cleanup — noting some Jobber
+objects cannot be hard-deleted, so residue is likely. **This has not been done
+and requires an explicit decision.**
+
+---
+
+## 6. Deployment (Coolify on the Mac mini) — DONE
+
+Live at **`https://jobber-mcp.aaronroberts.xyz/mcp`**.
+
+| Item | Value |
+| --- | --- |
+| Coolify project | `jobber-mcp` (`wsx0mj9p6dg4fycpi5gqjamo`) |
+| Application | `jobber-mcp` (`v97einys55h5vuerubtg74c1`) |
+| Server | `mac-mini-colima`, network `coolify` |
+| Source | public GitHub repo, branch `main`, Dockerfile build |
+| Volume | `/data` (persistent) — **not optional**, see below |
+| Cloudflare | tunnel `baseball-model` ingress + proxied CNAME |
+
+Two traps worth recording:
+
+1. **Coolify's healthcheck overrides the Dockerfile's.** It shells out to
+   `curl`/`wget`, neither of which exists in `node:22-bookworm-slim`, so the
+   first deploy failed with a healthy container. Fix: disable the Coolify
+   healthcheck so it uses the image's own `HEALTHCHECK` (which uses Node's
+   built-in fetch). Coolify then reports `custom_healthcheck_found: true`.
+2. **FQDN uses the `http` scheme on purpose.** Cloudflare terminates TLS at the
+   edge; an `https` FQDN makes Traefik redirect-loop behind the tunnel.
+
+The `/data` volume is the source of truth for tokens. `JOBBER_REFRESH_TOKEN` in
+the Coolify env is a bootstrap value and goes stale after first boot — that is
+correct, not a bug.
+
+---
+
+## 7. Connecting clients
+
+The server refuses to start without `JOBBER_MCP_SECRET`: the tool set can mutate
+the Jobber account, so an unauthenticated public endpoint would let anyone who
+finds the URL write to it.
+
+```bash
+claude mcp add --transport http jobber https://jobber-mcp.aaronroberts.xyz/mcp \
+  -H "Authorization: Bearer <JOBBER_MCP_SECRET>"
+```
 
 `GET /health` is unauthenticated and returns `{"status":"ok"}`.
 
 ---
 
-## 7. Verification performed
-
-| Check | Result |
-| --- | --- |
-| `tsc --noEmit` | exit 0 |
-| stdio transport + live Jobber | 102 tools, real client data, launched from unrelated cwd via `JOBBER_ENV_FILE` |
-| HTTP transport + live Jobber | 401 without token, 401 wrong token, 404 unknown path, live data, 4 concurrent calls |
-| Multi-process refresh (6 processes, shared store) | 6/6 succeed, **1** OAuth call, 0 reuse rejections |
-| Same test, lock disabled (control) | **5 of 6 fail** with `invalid_grant` — confirms the fix is load-bearing |
-| Docker image build | succeeds (linux/arm64) |
-| Container against stub Jobber | healthy, auth gate holds, tool call returns |
-| Container restart | reuses volume token — 1 refresh across 2 container lifetimes |
-
-The container tests deliberately used a **stub** Jobber, not the real one:
-running it for real would have rotated the refresh token and killed the laptop's
-store (§3).
-
----
-
 ## 8. Known gaps
 
+- **No mutation has been executed.** See §5. This is the largest remaining gap.
 - **No read-only mode.** `readOnlyHint` is derived from the tool name prefix and
-  is advisory. If most of the team should not be able to mutate Jobber, filter
-  `allTools` behind a `JOBBER_MCP_READ_ONLY` flag — small change, not made.
+  is advisory. Filter `allTools` behind a `JOBBER_MCP_READ_ONLY` flag if most of
+  the team should not be able to write.
 - **One shared secret, no per-user identity.** No audit trail of who called what.
-- **No automated test suite.** All verification above was done with throwaway
-  scripts, not committed tests. The multi-process concurrency test in particular
-  is worth keeping — it is the one that proved the lock matters.
-- **`src/main.ts` is a byte-identical duplicate of `src/index.ts`** and only
-  `index.ts` is wired to the `bin` entry. Looks like dead weight; left alone
-  because removing it was out of scope.
-- **README claims 104 tools; the server exposes 102.** Not chased down.
-- **`.DS_Store` is untracked and not in `.gitignore`.** Worth adding.
+- **No unit test suite.** The three verification scripts are committed and
+  repeatable, but there is no `npm test`.
+- **`src/types/jobber.ts` is stale** — it still describes the pre-fix shapes
+  (e.g. a `LineItem` type Jobber does not have). Tool modules no longer import
+  the dead types, but the file should be regenerated from the schema.
+- **`src/main.ts` is a byte-identical duplicate of `src/index.ts`**; only
+  `index.ts` is wired to `bin`.
+- **`forms-tools.ts` exports an empty object** and is still spread into
+  `allTools`. Harmless, and self-documenting, but could be removed.
 - **`react`/`react-dom` are runtime `dependencies`** (for `src/ui/react-app/`),
-  so they land in the production image unnecessarily. Moving them to
-  `devDependencies` would slim it.
+  so they land in the production image unnecessarily.
 
 ---
 
@@ -212,31 +269,29 @@ store (§3).
 
 | Path | Role |
 | --- | --- |
-| `src/auth/oauth.ts` | Authorize URL, code exchange, refresh. Expiry from `expires_in` → JWT `exp` → 55 min fallback, 60s skew |
+| `src/auth/oauth.ts` | Authorize URL, code exchange, refresh |
 | `src/auth/token-store.ts` | Atomic writes + O_EXCL lockfile with stale-lock breaking |
 | `src/auth/authorize-cli.ts` | One-time OAuth bootstrap (`npm run authorize`) |
-| `src/clients/jobber.ts` | GraphQL client: proactive refresh, 401 retry, lock-guarded refresh |
-| `src/server.ts` | `createJobberRuntime` / `createMcpServer` / `hydrateFromStore`, plus the stdio `JobberServer` |
+| `src/clients/jobber.ts` | GraphQL client, API version, shared field fragments |
+| `src/server.ts` | Runtime/MCP server construction, stdio `JobberServer` |
 | `src/http.ts` | Streamable HTTP transport, bearer auth, `/health` |
-| `src/load-env.ts` | `.env` loading via Node's built-in `process.loadEnvFile` (no dotenv dep) |
+| `scripts/fetch-schema.mjs` | Snapshot the schema; asserts served version |
+| `scripts/validate-graphql.mjs` | Layer 1 — document validation |
+| `scripts/audit-tools.mjs` | Layers 2+3 — variables and response shape |
+| `scripts/live-read-check.mjs` | Live read-only run, in-process |
+| `scripts/smoke-read-tools.mjs` | Live read-only run through the deployed HTTP server |
+| `schema/jobber-schema.{json,graphql}` | Pinned introspection of `2026-07-27` |
 | `Dockerfile`, `docker-compose.yaml` | Coolify deployment unit |
-
-State: committed through `0349a0f "jobber mcp"`. The HTTP transport, Docker
-files, and token-store locking are **uncommitted** on `main`.
 
 ---
 
 ## 10. Relationship to the main application
 
-Our main application already has a production Jobber integration that is
-strictly more capable than this one: encrypted per-tenant token storage, a
-database lease around refresh so concurrent workers cannot burn the single-use
-refresh token, and throttle-aware retry.
+The main application already has a production Jobber integration that is
+strictly more capable: encrypted per-tenant token storage, a database lease
+around refresh, and throttle-aware retry.
 
 This MCP server is a **separate dev/inspection tool** authenticating as one
-account. Do not route application traffic through it.
-
-If it ever needs to act per-tenant, the right move is to front that existing
-integration layer rather than build a second Jobber auth system here — two
-implementations that can disagree about token state is exactly the failure mode
-§3 describes, scaled up.
+account. Do not route application traffic through it. If it ever needs to act
+per-tenant, front that existing integration rather than build a second Jobber
+auth system here.

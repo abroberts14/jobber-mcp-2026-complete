@@ -13,6 +13,9 @@
     "dev": "tsc --watch",
     "start:http": "node dist/http.js",
     "authorize": "npm run build && node dist/auth/authorize-cli.js",
+    "schema:fetch": "node scripts/fetch-schema.mjs",
+    "validate:graphql": "npm run build && node scripts/validate-graphql.mjs",
+    "smoke:read": "node scripts/smoke-read-tools.mjs",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
@@ -35,6 +38,7 @@
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
+    "graphql": "^17.0.2",
     "typescript": "^5.7.2"
   }
 }

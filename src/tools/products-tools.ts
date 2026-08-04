@@ -1,60 +1,100 @@
 /**
  * Products/Services Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27. Notable shape differences from a
+ * naive reading of the API:
+ *   - IDs are `EncodedId`, not `ID`.
+ *   - The type is `ProductOrService`. There is no `unitPrice`, `type`, or
+ *     `isArchived` field — money is `defaultUnitCost` / `internalUnitCost`
+ *     (plain `Float`s), and the product/service split is `category`
+ *     (`ProductsAndServicesCategory`: `PRODUCT` | `SERVICE`).
+ *   - `ProductsFilterInput.category` is typed `[WorkItemCategoryTypeEnum!]`,
+ *     a DIFFERENT enum with differently-cased values (`Product` | `Service`)
+ *     from the one used on the entity/mutations (`ProductsAndServicesCategory`:
+ *     `PRODUCT` | `SERVICE`). Filtering has to translate between the two.
+ *   - There is a singular `product(id: EncodedId!)` query, in addition to
+ *     the `products` connection.
+ *   - Mutations are `productsAndServicesCreate` / `productsAndServicesEdit`
+ *     (not `productCreate`/`productUpdate`/`productArchive`). There is no
+ *     archive/delete mutation for products or services at all.
  */
 
 import { z } from 'zod';
 import { JobberClient } from '../clients/jobber.js';
 
+const PAGE_INFO = `
+  pageInfo {
+    hasNextPage
+    endCursor
+  }
+  totalCount
+`;
+
+const USER_ERRORS = `
+  userErrors {
+    message
+    path
+  }
+`;
+
+/** Standard product/service fields fragment (local to this module). */
+const PRODUCT_FIELDS = `
+  id
+  name
+  description
+  category
+  defaultUnitCost
+  internalUnitCost
+  markup
+  taxable
+  visible
+  durationMinutes
+  onlineBookingsEnabled
+`;
+
+/**
+ * Translate the entity-facing `ProductsAndServicesCategory` enum
+ * (`PRODUCT`/`SERVICE`, used on `ProductOrService.category` and the
+ * create/edit mutations) into `WorkItemCategoryTypeEnum` (`Product`/
+ * `Service`), which is what `ProductsFilterInput.category` actually expects.
+ */
+const CATEGORY_FILTER_VALUE: Record<'PRODUCT' | 'SERVICE', 'Product' | 'Service'> = {
+  PRODUCT: 'Product',
+  SERVICE: 'Service',
+};
+
 export const productsTools = {
   list_products: {
-    description: 'List all products and services',
+    description: 'List all products and services, optionally filtered by category or search term',
     inputSchema: z.object({
-      type: z.enum(['PRODUCT', 'SERVICE']).optional(),
-      isArchived: z.boolean().optional(),
+      category: z.enum(['PRODUCT', 'SERVICE']).optional(),
+      searchTerm: z.string().optional(),
       limit: z.number().default(50),
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filterConditions: string[] = [];
-      if (args.type) {
-        filterConditions.push(`type: ${args.type}`);
-      }
-      if (args.isArchived !== undefined) {
-        filterConditions.push(`isArchived: ${args.isArchived}`);
-      }
-
-      const filters = filterConditions.length > 0 ? `, filter: { ${filterConditions.join(', ')} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
+      const filter: Record<string, unknown> = {};
+      if (args.category) filter.category = [CATEGORY_FILTER_VALUE[args.category as 'PRODUCT' | 'SERVICE']];
 
       const query = `
-        query ListProducts {
-          products(first: ${args.limit}${afterClause}${filters}) {
-            edges {
-              node {
-                id
-                name
-                description
-                unitPrice {
-                  amount
-                  currency
-                }
-                type
-                isArchived
-              }
-              cursor
+        query ListProducts($first: Int, $after: String, $filter: ProductsFilterInput, $searchTerm: String) {
+          products(first: $first, after: $after, filter: $filter, searchTerm: $searchTerm) {
+            nodes {
+              ${PRODUCT_FIELDS}
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+        searchTerm: args.searchTerm,
+      });
       return {
-        products: data.products.edges.map((e: any) => e.node),
+        products: data.products.nodes,
         pageInfo: data.products.pageInfo,
         totalCount: data.products.totalCount,
       };
@@ -68,17 +108,9 @@ export const productsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetProduct($id: ID!) {
+        query GetProduct($id: EncodedId!) {
           product(id: $id) {
-            id
-            name
-            description
-            unitPrice {
-              amount
-              currency
-            }
-            type
-            isArchived
+            ${PRODUCT_FIELDS}
           }
         }
       `;
@@ -92,47 +124,48 @@ export const productsTools = {
     description: 'Create a new product or service',
     inputSchema: z.object({
       name: z.string(),
+      defaultUnitCost: z.number().describe('The default price for the service or product'),
       description: z.string().optional(),
-      unitPrice: z.number().optional(),
-      type: z.enum(['PRODUCT', 'SERVICE']).default('SERVICE'),
+      category: z.enum(['PRODUCT', 'SERVICE']).optional(),
+      taxable: z.boolean().optional(),
+      markup: z.number().optional(),
+      internalUnitCost: z.number().optional(),
+      durationMinutes: z.number().optional(),
+      onlineBookingsEnabled: z.boolean().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CreateProduct($input: ProductInput!) {
-          productCreate(input: $input) {
-            product {
-              id
-              name
-              description
-              unitPrice {
-                amount
-                currency
-              }
-              type
-              isArchived
+        mutation CreateProduct($input: ProductsAndServicesInput!) {
+          productsAndServicesCreate(input: $input) {
+            productOrService {
+              ${PRODUCT_FIELDS}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = {
+      const input: Record<string, unknown> = {
         name: args.name,
-        description: args.description,
-        unitPrice: args.unitPrice,
-        type: args.type,
+        defaultUnitCost: args.defaultUnitCost,
       };
+      if (args.description) input.description = args.description;
+      if (args.category) input.category = args.category;
+      if (args.taxable !== undefined) input.taxable = args.taxable;
+      if (args.markup !== undefined) input.markup = args.markup;
+      if (args.internalUnitCost !== undefined) input.internalUnitCost = args.internalUnitCost;
+      if (args.durationMinutes !== undefined) input.durationMinutes = args.durationMinutes;
+      if (args.onlineBookingsEnabled !== undefined) input.onlineBookingsEnabled = args.onlineBookingsEnabled;
 
       const data = await client.mutate(mutation, { input });
 
-      if (data.productCreate.userErrors?.length > 0) {
-        throw new Error(`Product creation failed: ${data.productCreate.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.productsAndServicesCreate.userErrors?.length > 0) {
+        throw new Error(
+          `Product creation failed: ${data.productsAndServicesCreate.userErrors.map((e: any) => e.message).join(', ')}`
+        );
       }
 
-      return { product: data.productCreate.product };
+      return { product: data.productsAndServicesCreate.productOrService };
     },
   },
 
@@ -142,74 +175,55 @@ export const productsTools = {
       productId: z.string(),
       name: z.string().optional(),
       description: z.string().optional(),
-      unitPrice: z.number().optional(),
+      defaultUnitCost: z.number().optional(),
+      category: z.enum(['PRODUCT', 'SERVICE']).optional(),
+      taxable: z.boolean().optional(),
+      markup: z.number().optional(),
+      internalUnitCost: z.number().optional(),
+      durationMinutes: z.number().optional(),
+      onlineBookingsEnabled: z.boolean().optional(),
+      visible: z.boolean().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation UpdateProduct($id: ID!, $input: ProductUpdateInput!) {
-          productUpdate(id: $id, input: $input) {
-            product {
-              id
-              name
-              description
-              unitPrice {
-                amount
-                currency
-              }
-              type
-              isArchived
+        mutation UpdateProduct($productOrServiceId: EncodedId!, $input: ProductsAndServicesEditInput!) {
+          productsAndServicesEdit(productOrServiceId: $productOrServiceId, input: $input) {
+            productOrService {
+              ${PRODUCT_FIELDS}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input: any = {};
+      const input: Record<string, unknown> = {};
       if (args.name) input.name = args.name;
       if (args.description) input.description = args.description;
-      if (args.unitPrice) input.unitPrice = args.unitPrice;
+      if (args.defaultUnitCost !== undefined) input.defaultUnitCost = args.defaultUnitCost;
+      if (args.category) input.category = args.category;
+      if (args.taxable !== undefined) input.taxable = args.taxable;
+      if (args.markup !== undefined) input.markup = args.markup;
+      if (args.internalUnitCost !== undefined) input.internalUnitCost = args.internalUnitCost;
+      if (args.durationMinutes !== undefined) input.durationMinutes = args.durationMinutes;
+      if (args.onlineBookingsEnabled !== undefined) input.onlineBookingsEnabled = args.onlineBookingsEnabled;
+      if (args.visible !== undefined) input.visible = args.visible;
 
-      const data = await client.mutate(mutation, { id: args.productId, input });
+      const data = await client.mutate(mutation, { productOrServiceId: args.productId, input });
 
-      if (data.productUpdate.userErrors?.length > 0) {
-        throw new Error(`Product update failed: ${data.productUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.productsAndServicesEdit.userErrors?.length > 0) {
+        throw new Error(
+          `Product update failed: ${data.productsAndServicesEdit.userErrors.map((e: any) => e.message).join(', ')}`
+        );
       }
 
-      return { product: data.productUpdate.product };
+      return { product: data.productsAndServicesEdit.productOrService };
     },
   },
 
-  delete_product: {
-    description: 'Delete (archive) a product or service',
-    inputSchema: z.object({
-      productId: z.string(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation DeleteProduct($id: ID!) {
-          productArchive(id: $id) {
-            product {
-              id
-              name
-              isArchived
-            }
-            userErrors {
-              message
-            }
-          }
-        }
-      `;
-
-      const data = await client.mutate(mutation, { id: args.productId });
-
-      if (data.productArchive.userErrors?.length > 0) {
-        throw new Error(`Product deletion failed: ${data.productArchive.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { product: data.productArchive.product };
-    },
-  },
+  // NOTE: `delete_product` was removed. It previously called a nonexistent
+  // `productArchive` mutation. The only product/service mutations in the
+  // schema are `productsAndServicesCreate` and `productsAndServicesEdit` —
+  // there is no archive/delete/unarchive mutation for `ProductOrService`,
+  // and `ProductOrService` has no `isArchived` field to toggle via edit
+  // either. If Jobber adds one, reintroduce this tool against it.
 };

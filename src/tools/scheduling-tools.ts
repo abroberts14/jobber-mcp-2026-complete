@@ -1,64 +1,102 @@
 /**
  * Scheduling Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27. Notable shape differences from a
+ * naive reading of the API:
+ *   - IDs are `EncodedId`, not `ID`.
+ *   - `visitCreate` takes a required `jobId` — a visit can't be created
+ *     without a job, so `jobId` is now a required input (was optional).
+ *   - `visitEdit` (title/instructions) and `visitEditSchedule` (start/end) are
+ *     two separate mutations with different argument names — there is no
+ *     single mutation that updates both. `VisitEditAttributes` has no
+ *     start/end/notes fields at all.
+ *   - `visitComplete`'s argument is `visitId`, not `id`.
+ *   - `assignedUsers` on Visit is a `UserConnection`, so it needs
+ *     `assignedUsers { nodes { ... } }`, not direct field selection.
+ *   - `VisitFilterAttributes` uses `startAt`/`endAt`
+ *     (`Iso8601DateTimeRangeInput` = `{ after, before, eq }`), not
+ *     `startDate`/`endDate` with gte/lte.
+ *   - `VisitStatusTypeEnum` is ACTIVE/COMPLETED/LATE/TODAY/UNSCHEDULED/UPCOMING
+ *     — not the UNSCHEDULED/SCHEDULED/IN_PROGRESS/COMPLETED/CANCELLED set this
+ *     file used to declare.
  */
 
 import { z } from 'zod';
 import { JobberClient } from '../clients/jobber.js';
 
+/** VisitStatusTypeEnum, verbatim. */
+const VISIT_STATUS = ['ACTIVE', 'COMPLETED', 'LATE', 'TODAY', 'UNSCHEDULED', 'UPCOMING'] as const;
+
+const PAGE_INFO = `
+  pageInfo {
+    hasNextPage
+    endCursor
+  }
+  totalCount
+`;
+
+const USER_ERRORS = `
+  userErrors {
+    message
+    path
+  }
+`;
+
+/** Split an ISO 8601 instant into Jobber's LocalDateTimeAttributes. */
+function toLocalDateTime(iso: string, timezone: string) {
+  const [date, rest] = iso.split('T');
+  const time = rest ? rest.replace(/(Z|[+-]\d{2}:?\d{2})$/, '') : undefined;
+  return { date, time, timezone };
+}
+
 export const schedulingTools = {
   list_visits: {
-    description: 'List all visits with optional date filtering',
+    description: 'List all visits with optional date-range and status filtering',
     inputSchema: z.object({
-      startDate: z.string().optional().describe('ISO 8601 date'),
-      endDate: z.string().optional().describe('ISO 8601 date'),
-      status: z.enum(['UNSCHEDULED', 'SCHEDULED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED']).optional(),
+      startDate: z.string().optional().describe('ISO 8601 datetime — lower bound for visit startAt'),
+      endDate: z.string().optional().describe('ISO 8601 datetime — upper bound for visit startAt'),
+      status: z.enum(VISIT_STATUS).optional(),
       limit: z.number().default(50),
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filterConditions: string[] = [];
-      if (args.startDate) {
-        filterConditions.push(`startDate: "${args.startDate}"`);
+      const filter: Record<string, unknown> = {};
+      if (args.status) filter.status = args.status;
+      if (args.startDate || args.endDate) {
+        filter.startAt = {
+          after: args.startDate,
+          before: args.endDate,
+        };
       }
-      if (args.endDate) {
-        filterConditions.push(`endDate: "${args.endDate}"`);
-      }
-      if (args.status) {
-        filterConditions.push(`status: ${args.status}`);
-      }
-
-      const filters = filterConditions.length > 0 ? `, filter: { ${filterConditions.join(', ')} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
 
       const query = `
-        query ListVisits {
-          visits(first: ${args.limit}${afterClause}${filters}) {
-            edges {
-              node {
-                ${JobberClient.visitFields}
-                job {
-                  id
-                  jobNumber
-                  title
-                }
-                assignedUsers {
+        query ListVisits($first: Int, $after: String, $filter: VisitFilterAttributes) {
+          visits(first: $first, after: $after, filter: $filter) {
+            nodes {
+              ${JobberClient.visitFields}
+              job {
+                id
+                jobNumber
+                title
+              }
+              assignedUsers {
+                nodes {
                   ${JobberClient.userFields}
                 }
               }
-              cursor
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+      });
       return {
-        visits: data.visits.edges.map((e: any) => e.node),
+        visits: data.visits.nodes,
         pageInfo: data.visits.pageInfo,
         totalCount: data.visits.totalCount,
       };
@@ -72,7 +110,7 @@ export const schedulingTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetVisit($id: ID!) {
+        query GetVisit($id: EncodedId!) {
           visit(id: $id) {
             ${JobberClient.visitFields}
             job {
@@ -81,7 +119,9 @@ export const schedulingTools = {
               title
             }
             assignedUsers {
-              ${JobberClient.userFields}
+              nodes {
+                ${JobberClient.userFields}
+              }
             }
           }
         }
@@ -93,86 +133,117 @@ export const schedulingTools = {
   },
 
   create_visit: {
-    description: 'Create a new visit',
+    description:
+      'Create a new visit on a job. Every visit belongs to a job (jobId is required), and Jobber schedules it with a local date/time plus timezone rather than a bare UTC instant.',
     inputSchema: z.object({
-      title: z.string(),
-      jobId: z.string().optional(),
-      startAt: z.string().describe('ISO 8601 datetime'),
-      endAt: z.string().describe('ISO 8601 datetime'),
-      userIds: z.array(z.string()).optional(),
-      notes: z.string().optional(),
+      jobId: z.string().describe('The job to create the visit on'),
+      title: z.string().optional(),
+      instructions: z.string().optional(),
+      startAt: z.string().describe('ISO 8601 datetime, e.g. 2026-03-01T09:00:00'),
+      endAt: z.string().optional().describe('ISO 8601 datetime'),
+      timezone: z.string().default('UTC').describe('IANA timezone, e.g. America/Denver'),
+      assignedUserIds: z.array(z.string()).optional(),
+      notifyTeam: z.boolean().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CreateVisit($input: VisitInput!) {
-          visitCreate(input: $input) {
-            visit {
+        mutation CreateVisit($jobId: EncodedId!, $input: VisitCreateInput!) {
+          visitCreate(jobId: $jobId, input: $input) {
+            createdVisits {
               ${JobberClient.visitFields}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = {
-        title: args.title,
-        jobId: args.jobId,
-        startAt: args.startAt,
-        endAt: args.endAt,
-        userIds: args.userIds,
-        notes: args.notes,
+      const schedule: Record<string, unknown> = {
+        startAt: toLocalDateTime(args.startAt, args.timezone),
       };
+      if (args.endAt) schedule.endAt = toLocalDateTime(args.endAt, args.timezone);
+      if (args.assignedUserIds) schedule.teamMemberIdsToAssign = args.assignedUserIds;
+      if (args.notifyTeam !== undefined) schedule.notifyTeam = args.notifyTeam;
 
-      const data = await client.mutate(mutation, { input });
+      const visit: Record<string, unknown> = { schedule };
+      if (args.title) visit.title = args.title;
+      if (args.instructions) visit.instructions = args.instructions;
+
+      const data = await client.mutate(mutation, {
+        jobId: args.jobId,
+        input: { visits: [visit] },
+      });
 
       if (data.visitCreate.userErrors?.length > 0) {
         throw new Error(`Visit creation failed: ${data.visitCreate.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { visit: data.visitCreate.visit };
+      return { visits: data.visitCreate.createdVisits };
     },
   },
 
   update_visit: {
-    description: 'Update an existing visit',
+    description:
+      'Update an existing visit. Title/instructions go through visitEdit; a start/end reschedule goes through the separate visitEditSchedule mutation, since VisitEditAttributes carries no schedule fields.',
     inputSchema: z.object({
       visitId: z.string(),
       title: z.string().optional(),
+      instructions: z.string().optional(),
       startAt: z.string().optional().describe('ISO 8601 datetime'),
       endAt: z.string().optional().describe('ISO 8601 datetime'),
-      notes: z.string().optional(),
+      timezone: z.string().default('UTC').describe('IANA timezone, used only when rescheduling'),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation UpdateVisit($id: ID!, $input: VisitUpdateInput!) {
-          visitUpdate(id: $id, input: $input) {
-            visit {
-              ${JobberClient.visitFields}
-            }
-            userErrors {
-              message
-              path
+      let visit: any;
+
+      if (args.title !== undefined || args.instructions !== undefined) {
+        const mutation = `
+          mutation UpdateVisit($id: EncodedId!, $attributes: VisitEditAttributes!) {
+            visitEdit(id: $id, attributes: $attributes) {
+              visit {
+                ${JobberClient.visitFields}
+              }
+              ${USER_ERRORS}
             }
           }
+        `;
+
+        const attributes: Record<string, unknown> = {};
+        if (args.title !== undefined) attributes.title = args.title;
+        if (args.instructions !== undefined) attributes.instructions = args.instructions;
+
+        const data = await client.mutate(mutation, { id: args.visitId, attributes });
+
+        if (data.visitEdit.userErrors?.length > 0) {
+          throw new Error(`Visit update failed: ${data.visitEdit.userErrors.map((e: any) => e.message).join(', ')}`);
         }
-      `;
-
-      const input: any = {};
-      if (args.title) input.title = args.title;
-      if (args.startAt) input.startAt = args.startAt;
-      if (args.endAt) input.endAt = args.endAt;
-      if (args.notes) input.notes = args.notes;
-
-      const data = await client.mutate(mutation, { id: args.visitId, input });
-
-      if (data.visitUpdate.userErrors?.length > 0) {
-        throw new Error(`Visit update failed: ${data.visitUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
+        visit = data.visitEdit.visit;
       }
 
-      return { visit: data.visitUpdate.visit };
+      if (args.startAt || args.endAt) {
+        const mutation = `
+          mutation RescheduleVisit($id: EncodedId!, $input: VisitEditScheduleInput!) {
+            visitEditSchedule(id: $id, input: $input) {
+              visit {
+                ${JobberClient.visitFields}
+              }
+              ${USER_ERRORS}
+            }
+          }
+        `;
+
+        const input: Record<string, unknown> = {};
+        if (args.startAt) input.startAt = toLocalDateTime(args.startAt, args.timezone);
+        if (args.endAt) input.endAt = toLocalDateTime(args.endAt, args.timezone);
+
+        const data = await client.mutate(mutation, { id: args.visitId, input });
+
+        if (data.visitEditSchedule.userErrors?.length > 0) {
+          throw new Error(`Visit reschedule failed: ${data.visitEditSchedule.userErrors.map((e: any) => e.message).join(', ')}`);
+        }
+        visit = data.visitEditSchedule.visit;
+      }
+
+      return { visit };
     },
   },
 
@@ -183,19 +254,17 @@ export const schedulingTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CompleteVisit($id: ID!) {
-          visitComplete(id: $id) {
+        mutation CompleteVisit($visitId: EncodedId!) {
+          visitComplete(visitId: $visitId) {
             visit {
               ${JobberClient.visitFields}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const data = await client.mutate(mutation, { id: args.visitId });
+      const data = await client.mutate(mutation, { visitId: args.visitId });
 
       if (data.visitComplete.userErrors?.length > 0) {
         throw new Error(`Visit completion failed: ${data.visitComplete.userErrors.map((e: any) => e.message).join(', ')}`);
@@ -212,17 +281,19 @@ export const schedulingTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetVisitAssignments($id: ID!) {
+        query GetVisitAssignments($id: EncodedId!) {
           visit(id: $id) {
             assignedUsers {
-              ${JobberClient.userFields}
+              nodes {
+                ${JobberClient.userFields}
+              }
             }
           }
         }
       `;
 
       const data = await client.query(query, { id: args.visitId });
-      return { assignedUsers: data.visit.assignedUsers };
+      return { assignedUsers: data.visit?.assignedUsers?.nodes ?? [] };
     },
   },
 };

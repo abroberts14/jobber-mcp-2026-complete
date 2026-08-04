@@ -1,9 +1,53 @@
 /**
  * Clients Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27. Notable shape differences from a
+ * naive reading of the API:
+ *   - IDs are `EncodedId`, not `ID`.
+ *   - Mutation signatures are `clientCreate`/`clientEdit`/`clientArchive`; the
+ *     edit/archive ID argument is `clientId`, not `id`.
+ *   - `ClientCreateInput`/`ClientEditInput` have no scalar `email`/`phone`
+ *     field. Emails/phones are lists (`EmailCreateAttributes`/
+ *     `PhoneNumberCreateAttributes`) — `emails`/`phones` on create,
+ *     `emailsToAdd`/`phonesToAdd` (plus ToEdit/ToDelete) on edit.
+ *   - `clients` has no `filter: { search }`; free-text search is the
+ *     top-level `searchTerm` argument.
+ *   - `Client.properties` is deprecated in favor of `clientProperties`, a
+ *     Connection (`nodes { ... }`), and `Property` has no `isDefault` field.
  */
 
 import { z } from 'zod';
 import { JobberClient } from '../clients/jobber.js';
+
+const PAGE_INFO = `
+  pageInfo {
+    hasNextPage
+    endCursor
+  }
+  totalCount
+`;
+
+const USER_ERRORS = `
+  userErrors {
+    message
+    path
+  }
+`;
+
+/** No shared JobberClient.propertyFields fragment exists, so it's local here. */
+const PROPERTY_FIELDS = `
+  id
+  name
+  isBillingAddress
+  address {
+    street1
+    street2
+    city
+    province
+    postalCode
+    country
+  }
+`;
 
 export const clientsTools = {
   list_clients: {
@@ -14,28 +58,28 @@ export const clientsTools = {
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filters = args.isArchived !== undefined ? `, filter: { isArchived: ${args.isArchived} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
+      const filter: Record<string, unknown> = {};
+      if (args.isArchived !== undefined) filter.isArchived = args.isArchived;
 
       const query = `
-        query ListClients {
-          clients(first: ${args.limit}${afterClause}${filters}) {
+        query ListClients($first: Int, $after: String, $filter: ClientFilterAttributes) {
+          clients(first: $first, after: $after, filter: $filter) {
             edges {
               node {
                 ${JobberClient.clientFields}
               }
               cursor
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+      });
       return {
         clients: data.clients.edges.map((e: any) => e.node),
         pageInfo: data.clients.pageInfo,
@@ -51,7 +95,7 @@ export const clientsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetClient($id: ID!) {
+        query GetClient($id: EncodedId!) {
           client(id: $id) {
             ${JobberClient.clientFields}
           }
@@ -64,7 +108,8 @@ export const clientsTools = {
   },
 
   create_client: {
-    description: 'Create a new client',
+    description:
+      'Create a new client. Email and phone, if given, are stored as the primary entry in Jobber’s email/phone lists (there is no scalar email/phone field on the create input).',
     inputSchema: z.object({
       firstName: z.string(),
       lastName: z.string(),
@@ -82,27 +127,24 @@ export const clientsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CreateClient($input: ClientInput!) {
+        mutation CreateClient($input: ClientCreateInput!) {
           clientCreate(input: $input) {
             client {
               ${JobberClient.clientFields}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = {
+      const input: Record<string, unknown> = {
         firstName: args.firstName,
         lastName: args.lastName,
-        companyName: args.companyName,
-        email: args.email,
-        phone: args.phone,
-        billingAddress: args.billingAddress,
       };
+      if (args.companyName) input.companyName = args.companyName;
+      if (args.email) input.emails = [{ address: args.email, primary: true }];
+      if (args.phone) input.phones = [{ number: args.phone, primary: true }];
+      if (args.billingAddress) input.billingAddress = args.billingAddress;
 
       const data = await client.mutate(mutation, { input });
 
@@ -115,7 +157,8 @@ export const clientsTools = {
   },
 
   update_client: {
-    description: 'Update an existing client',
+    description:
+      'Update an existing client. Email and phone, if given, are ADDED to the client’s email/phone lists as a new primary entry — Jobber has no scalar field to overwrite an existing one in place.',
     inputSchema: z.object({
       clientId: z.string(),
       firstName: z.string().optional(),
@@ -126,33 +169,30 @@ export const clientsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation UpdateClient($id: ID!, $input: ClientUpdateInput!) {
-          clientUpdate(id: $id, input: $input) {
+        mutation UpdateClient($clientId: EncodedId!, $input: ClientEditInput!) {
+          clientEdit(clientId: $clientId, input: $input) {
             client {
               ${JobberClient.clientFields}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input: any = {};
+      const input: Record<string, unknown> = {};
       if (args.firstName) input.firstName = args.firstName;
       if (args.lastName) input.lastName = args.lastName;
       if (args.companyName) input.companyName = args.companyName;
-      if (args.email) input.email = args.email;
-      if (args.phone) input.phone = args.phone;
+      if (args.email) input.emailsToAdd = [{ address: args.email, primary: true }];
+      if (args.phone) input.phonesToAdd = [{ number: args.phone, primary: true }];
 
-      const data = await client.mutate(mutation, { id: args.clientId, input });
+      const data = await client.mutate(mutation, { clientId: args.clientId, input });
 
-      if (data.clientUpdate.userErrors?.length > 0) {
-        throw new Error(`Client update failed: ${data.clientUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
+      if (data.clientEdit.userErrors?.length > 0) {
+        throw new Error(`Client update failed: ${data.clientEdit.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { client: data.clientUpdate.client };
+      return { client: data.clientEdit.client };
     },
   },
 
@@ -163,19 +203,17 @@ export const clientsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation ArchiveClient($id: ID!) {
-          clientArchive(id: $id) {
+        mutation ArchiveClient($clientId: EncodedId!) {
+          clientArchive(clientId: $clientId) {
             client {
               ${JobberClient.clientFields}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const data = await client.mutate(mutation, { id: args.clientId });
+      const data = await client.mutate(mutation, { clientId: args.clientId });
 
       if (data.clientArchive.userErrors?.length > 0) {
         throw new Error(`Client archive failed: ${data.clientArchive.userErrors.map((e: any) => e.message).join(', ')}`);
@@ -193,8 +231,8 @@ export const clientsTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query SearchClients($query: String!, $limit: Int!) {
-          clients(first: $limit, filter: { search: $query }) {
+        query SearchClients($searchTerm: String, $first: Int) {
+          clients(searchTerm: $searchTerm, first: $first) {
             edges {
               node {
                 ${JobberClient.clientFields}
@@ -205,7 +243,7 @@ export const clientsTools = {
         }
       `;
 
-      const data = await client.query(query, { query: args.query, limit: args.limit });
+      const data = await client.query(query, { searchTerm: args.query, first: args.limit });
       return {
         clients: data.clients.edges.map((e: any) => e.node),
         totalCount: data.clients.totalCount,
@@ -217,29 +255,33 @@ export const clientsTools = {
     description: 'List all properties for a specific client',
     inputSchema: z.object({
       clientId: z.string(),
+      limit: z.number().default(50),
+      cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetClientProperties($id: ID!) {
+        query GetClientProperties($id: EncodedId!, $first: Int, $after: String) {
           client(id: $id) {
-            properties {
-              id
-              isDefault
-              address {
-                street1
-                street2
-                city
-                province
-                postalCode
-                country
+            clientProperties(first: $first, after: $after) {
+              nodes {
+                ${PROPERTY_FIELDS}
               }
+              ${PAGE_INFO}
             }
           }
         }
       `;
 
-      const data = await client.query(query, { id: args.clientId });
-      return { properties: data.client.properties };
+      const data = await client.query(query, {
+        id: args.clientId,
+        first: args.limit,
+        after: args.cursor,
+      });
+      return {
+        properties: data.client?.clientProperties?.nodes ?? [],
+        pageInfo: data.client?.clientProperties?.pageInfo,
+        totalCount: data.client?.clientProperties?.totalCount,
+      };
     },
   },
 };

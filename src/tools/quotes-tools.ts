@@ -1,52 +1,86 @@
 /**
  * Quotes Tools for Jobber MCP Server
+ *
+ * Written against Jobber GraphQL 2026-07-27. Notable shape differences from a
+ * naive reading of the API:
+ *   - IDs are `EncodedId`, not `ID`.
+ *   - Quote status enum values are lowercase (QuoteStatusTypeEnum: `draft`,
+ *     `awaiting_response`, `approved`, `changes_requested`, `converted`,
+ *     `archived`) — there is no `SENT` or `EXPIRED` status.
+ *   - Mutations use `Edit`, not `Update` (`quoteEdit`), and `quoteCreate`
+ *     takes `attributes: QuoteCreateAttributes!`, not `input:`.
+ *   - There is no `quoteSend` or `quoteApprove` mutation. Sending a quote and
+ *     a client approving it are client-hub-driven actions the public API does
+ *     not expose a mutation for (QuoteEditAttributes.sentAt only records a
+ *     timestamp — it does not trigger an email or change quoteStatus).
+ *   - There is no `quoteConvertToJob` mutation either. The real equivalent is
+ *     `jobCreate(input: { quoteId, ... })` — Jobber links the new job back to
+ *     the quote via `quoteId`, which is how a quote becomes a job.
+ *   - `quote.lineItems` is a Connection — select `nodes { ... }`, not fields
+ *     directly.
  */
 
 import { z } from 'zod';
 import { JobberClient } from '../clients/jobber.js';
 
+/** QuoteStatusTypeEnum, verbatim. */
+const QUOTE_STATUS = [
+  'draft', 'awaiting_response', 'approved', 'changes_requested', 'converted', 'archived',
+] as const;
+
+/** BillingStrategy, verbatim — used only by convert_quote_to_job's jobCreate call. */
+const INVOICING_TYPE = ['FIXED_PRICE', 'VISIT_BASED'] as const;
+
+/** BillingFrequencyEnum, verbatim — used only by convert_quote_to_job's jobCreate call. */
+const INVOICING_SCHEDULE = ['ON_COMPLETION', 'PERIODIC', 'PER_VISIT', 'NEVER'] as const;
+
+const PAGE_INFO = `
+  pageInfo {
+    hasNextPage
+    endCursor
+  }
+  totalCount
+`;
+
+const USER_ERRORS = `
+  userErrors {
+    message
+    path
+  }
+`;
+
 export const quotesTools = {
   list_quotes: {
-    description: 'List all quotes with optional filtering',
+    description: 'List quotes with optional filtering by status or client',
     inputSchema: z.object({
-      status: z.enum(['DRAFT', 'SENT', 'APPROVED', 'CHANGES_REQUESTED', 'CONVERTED', 'EXPIRED']).optional(),
+      status: z.enum(QUOTE_STATUS).optional(),
       clientId: z.string().optional(),
       limit: z.number().default(50),
       cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
-      const filterConditions: string[] = [];
-      if (args.status) {
-        filterConditions.push(`status: ${args.status}`);
-      }
-      if (args.clientId) {
-        filterConditions.push(`clientId: "${args.clientId}"`);
-      }
-
-      const filters = filterConditions.length > 0 ? `, filter: { ${filterConditions.join(', ')} }` : '';
-      const afterClause = args.cursor ? `, after: "${args.cursor}"` : '';
+      const filter: Record<string, unknown> = {};
+      if (args.status) filter.status = args.status;
+      if (args.clientId) filter.clientId = args.clientId;
 
       const query = `
-        query ListQuotes {
-          quotes(first: ${args.limit}${afterClause}${filters}) {
-            edges {
-              node {
-                ${JobberClient.quoteFields}
-              }
-              cursor
+        query ListQuotes($first: Int, $after: String, $filter: QuoteFilterAttributes) {
+          quotes(first: $first, after: $after, filter: $filter) {
+            nodes {
+              ${JobberClient.quoteFields}
             }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            totalCount
+            ${PAGE_INFO}
           }
         }
       `;
 
-      const data = await client.query(query);
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+      });
       return {
-        quotes: data.quotes.edges.map((e: any) => e.node),
+        quotes: data.quotes.nodes,
         pageInfo: data.quotes.pageInfo,
         totalCount: data.quotes.totalCount,
       };
@@ -60,7 +94,7 @@ export const quotesTools = {
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetQuote($id: ID!) {
+        query GetQuote($id: EncodedId!) {
           quote(id: $id) {
             ${JobberClient.quoteFields}
           }
@@ -73,42 +107,57 @@ export const quotesTools = {
   },
 
   create_quote: {
-    description: 'Create a new quote',
+    description:
+      'Create a new quote. Jobber requires an explicit propertyId (in addition to clientId) and at least one line item.',
     inputSchema: z.object({
-      title: z.string(),
+      title: z.string().optional(),
+      message: z.string().optional(),
       clientId: z.string(),
-      propertyId: z.string().optional(),
-      lineItems: z.array(z.object({
-        name: z.string(),
-        description: z.string().optional(),
-        quantity: z.number(),
-        unitPrice: z.number().optional(),
-        productId: z.string().optional(),
-      })).optional(),
+      propertyId: z.string(),
+      lineItems: z
+        .array(
+          z.object({
+            name: z.string(),
+            description: z.string().optional(),
+            quantity: z.number().optional(),
+            unitPrice: z.number().optional(),
+            taxable: z.boolean().optional(),
+            productOrServiceId: z.string().optional(),
+            saveToProductsAndServices: z.boolean().default(false),
+          })
+        )
+        .min(1),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation CreateQuote($input: QuoteInput!) {
-          quoteCreate(input: $input) {
+        mutation CreateQuote($attributes: QuoteCreateAttributes!) {
+          quoteCreate(attributes: $attributes) {
             quote {
               ${JobberClient.quoteFields}
             }
-            userErrors {
-              message
-              path
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const input = {
-        title: args.title,
+      const attributes: Record<string, unknown> = {
         clientId: args.clientId,
         propertyId: args.propertyId,
-        lineItems: args.lineItems,
+        lineItems: args.lineItems.map((li: any) => ({
+          name: li.name,
+          description: li.description,
+          quantity: li.quantity,
+          unitPrice: li.unitPrice,
+          taxable: li.taxable,
+          productOrServiceId: li.productOrServiceId,
+          // Required by QuoteCreateLineItemAttributes; default to not saving.
+          saveToProductsAndServices: li.saveToProductsAndServices ?? false,
+        })),
       };
+      if (args.title) attributes.title = args.title;
+      if (args.message) attributes.message = args.message;
 
-      const data = await client.mutate(mutation, { input });
+      const data = await client.mutate(mutation, { attributes });
 
       if (data.quoteCreate.userErrors?.length > 0) {
         throw new Error(`Quote creation failed: ${data.quoteCreate.userErrors.map((e: any) => e.message).join(', ')}`);
@@ -123,120 +172,89 @@ export const quotesTools = {
     inputSchema: z.object({
       quoteId: z.string(),
       title: z.string().optional(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation UpdateQuote($id: ID!, $input: QuoteUpdateInput!) {
-          quoteUpdate(id: $id, input: $input) {
-            quote {
-              ${JobberClient.quoteFields}
-            }
-            userErrors {
-              message
-              path
-            }
-          }
-        }
-      `;
-
-      const input: any = {};
-      if (args.title) input.title = args.title;
-
-      const data = await client.mutate(mutation, { id: args.quoteId, input });
-
-      if (data.quoteUpdate.userErrors?.length > 0) {
-        throw new Error(`Quote update failed: ${data.quoteUpdate.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { quote: data.quoteUpdate.quote };
-    },
-  },
-
-  send_quote: {
-    description: 'Send a quote to the client',
-    inputSchema: z.object({
-      quoteId: z.string(),
       message: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const mutation = `
-        mutation SendQuote($id: ID!, $message: String) {
-          quoteSend(id: $id, message: $message) {
+        mutation UpdateQuote($quoteId: EncodedId!, $attributes: QuoteEditAttributes!) {
+          quoteEdit(quoteId: $quoteId, attributes: $attributes) {
             quote {
               ${JobberClient.quoteFields}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const data = await client.mutate(mutation, { id: args.quoteId, message: args.message });
+      const attributes: Record<string, unknown> = {};
+      if (args.title) attributes.title = args.title;
+      if (args.message) attributes.message = args.message;
 
-      if (data.quoteSend.userErrors?.length > 0) {
-        throw new Error(`Quote send failed: ${data.quoteSend.userErrors.map((e: any) => e.message).join(', ')}`);
+      const data = await client.mutate(mutation, { quoteId: args.quoteId, attributes });
+
+      if (data.quoteEdit.userErrors?.length > 0) {
+        throw new Error(`Quote update failed: ${data.quoteEdit.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { quote: data.quoteSend.quote };
-    },
-  },
-
-  approve_quote: {
-    description: 'Approve a quote',
-    inputSchema: z.object({
-      quoteId: z.string(),
-    }),
-    execute: async (client: JobberClient, args: any) => {
-      const mutation = `
-        mutation ApproveQuote($id: ID!) {
-          quoteApprove(id: $id) {
-            quote {
-              ${JobberClient.quoteFields}
-            }
-            userErrors {
-              message
-            }
-          }
-        }
-      `;
-
-      const data = await client.mutate(mutation, { id: args.quoteId });
-
-      if (data.quoteApprove.userErrors?.length > 0) {
-        throw new Error(`Quote approval failed: ${data.quoteApprove.userErrors.map((e: any) => e.message).join(', ')}`);
-      }
-
-      return { quote: data.quoteApprove.quote };
+      return { quote: data.quoteEdit.quote };
     },
   },
 
   convert_quote_to_job: {
-    description: 'Convert an approved quote to a job',
+    description:
+      'Convert a quote into a job. There is no dedicated conversion mutation — this calls jobCreate(quoteId:), which is how Jobber links a new job back to the quote it came from. The property defaults to the quote\'s own property when not supplied.',
     inputSchema: z.object({
       quoteId: z.string(),
+      propertyId: z.string().optional().describe("Defaults to the quote's own property"),
+      invoicingType: z.enum(INVOICING_TYPE).default('FIXED_PRICE'),
+      invoicingSchedule: z.enum(INVOICING_SCHEDULE).default('ON_COMPLETION'),
     }),
     execute: async (client: JobberClient, args: any) => {
+      let propertyId = args.propertyId;
+      if (!propertyId) {
+        const propertyQuery = `
+          query GetQuoteProperty($id: EncodedId!) {
+            quote(id: $id) {
+              property {
+                id
+              }
+            }
+          }
+        `;
+        const quoteData = await client.query(propertyQuery, { id: args.quoteId });
+        propertyId = quoteData.quote?.property?.id;
+        if (!propertyId) {
+          throw new Error('Quote has no associated property; pass propertyId explicitly.');
+        }
+      }
+
       const mutation = `
-        mutation ConvertQuoteToJob($id: ID!) {
-          quoteConvertToJob(id: $id) {
+        mutation ConvertQuoteToJob($input: JobCreateAttributes!) {
+          jobCreate(input: $input) {
             job {
               ${JobberClient.jobFields}
             }
-            userErrors {
-              message
-            }
+            ${USER_ERRORS}
           }
         }
       `;
 
-      const data = await client.mutate(mutation, { id: args.quoteId });
+      const input = {
+        propertyId,
+        quoteId: args.quoteId,
+        invoicing: {
+          invoicingType: args.invoicingType,
+          invoicingSchedule: args.invoicingSchedule,
+        },
+      };
 
-      if (data.quoteConvertToJob.userErrors?.length > 0) {
-        throw new Error(`Quote conversion failed: ${data.quoteConvertToJob.userErrors.map((e: any) => e.message).join(', ')}`);
+      const data = await client.mutate(mutation, { input });
+
+      if (data.jobCreate.userErrors?.length > 0) {
+        throw new Error(`Quote conversion failed: ${data.jobCreate.userErrors.map((e: any) => e.message).join(', ')}`);
       }
 
-      return { job: data.quoteConvertToJob.job };
+      return { job: data.jobCreate.job };
     },
   },
 
@@ -244,20 +262,40 @@ export const quotesTools = {
     description: 'List all line items for a specific quote',
     inputSchema: z.object({
       quoteId: z.string(),
+      limit: z.number().default(50),
+      cursor: z.string().optional(),
     }),
     execute: async (client: JobberClient, args: any) => {
       const query = `
-        query GetQuoteLineItems($id: ID!) {
+        query GetQuoteLineItems($id: EncodedId!, $first: Int, $after: String) {
           quote(id: $id) {
-            lineItems {
-              ${JobberClient.lineItemFields}
+            lineItems(first: $first, after: $after) {
+              nodes {
+                ${JobberClient.lineItemFields}
+                category
+                optional
+                recommended
+                textOnly
+                sortOrder
+                markup
+                unitCost
+              }
+              ${PAGE_INFO}
             }
           }
         }
       `;
 
-      const data = await client.query(query, { id: args.quoteId });
-      return { lineItems: data.quote.lineItems };
+      const data = await client.query(query, {
+        id: args.quoteId,
+        first: args.limit,
+        after: args.cursor,
+      });
+      return {
+        lineItems: data.quote?.lineItems?.nodes ?? [],
+        pageInfo: data.quote?.lineItems?.pageInfo,
+        totalCount: data.quote?.lineItems?.totalCount,
+      };
     },
   },
 };

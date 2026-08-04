@@ -7,7 +7,7 @@ account unless explicitly marked otherwise.
 
 ## 1. What this is
 
-An MCP server exposing **73 tools** over Jobber's GraphQL API (15 tool modules
+An MCP server exposing **86 tools** over Jobber's GraphQL API (15 tool modules
 under `src/tools/`). It ships two transports:
 
 | Transport | Entry point | Use |
@@ -19,8 +19,8 @@ It is **single-tenant**. Every caller acts as the one Jobber account the server
 is authorized against. This is an access gate for a team that already shares an
 account — not a multi-user system.
 
-> The tool count was 102. It is now 73 because 29 tools called Jobber
-> queries/mutations that do not exist. See §4.
+> The tool count was 102. 29 tools called Jobber queries/mutations that do not
+> exist and were deleted; 13 real operations had no tool and were added. See §4.
 
 ---
 
@@ -177,26 +177,50 @@ All three are **fully offline and never send a mutation.**
 | Check | Result |
 | --- | --- |
 | `tsc --noEmit` | exit 0 |
-| Document validation | **73/73** |
-| Deep audit (documents + variables + response shape) | **73/73** |
-| Live read-only run against real Jobber | **33 passed, 0 failed, 5 skipped** |
+| Document validation | **86/86** |
+| Deep audit (documents + variables + response shape) | **86/86** |
+| Live read-only run against real Jobber | **37 passed, 0 failed, 4 skipped** |
+| Live mutation run against the sandbox | **38 passed, 4 failed** |
 
-The 5 skips are `get_invoice`, `list_invoice_payments`, `get_expense`,
-`get_timesheet_entry`, `get_tax_rate` — the test account holds no invoices,
-expenses, timesheet entries, or tax rates, so no real ID exists to fetch.
+Read skips are `get_payment`, `get_expense`, `get_timesheet_entry`,
+`get_tax_rate` — the account holds no such records, so no real ID exists to
+fetch. `scripts/live-mutation-check.mjs` covers the write half; run it only
+against a sandbox.
+
+### The 4 mutation failures are an OAuth scope limit, not code
+
+```
+create_expense   -> "An object of type ExpenseCreate was hidden due to permissions"
+create_tax_rate  -> "An object of type TaxCreate was hidden due to permissions"
+```
+
+`update_expense` and `create_tax_group` then fail only because they had no ID to
+work with. The tools are schema-correct; the **Jobber app lacks expense and tax
+write scopes**. Add them at developer.getjobber.com, re-authorize, and re-run.
+
+### Two live-only findings that no static check could reach
+
+- **`productsSearch` is broken server-side.** It is in the schema but its
+  resolver returns HTTP 500 for every input, including the most minimal
+  selection. `search_products` therefore uses `products(searchTerm:)`, which
+  takes the same argument and works.
+- **Jobber's search index lags writes by seconds.** A client created and then
+  immediately searched for returns 0 results, then appears shortly after. Not a
+  bug — but it means "the call succeeded" and "the data is findable" are
+  different claims.
 
 ### ⚠️ What is still NOT proven
 
-**No mutation has ever been executed against Jobber.** Roughly half the tools
-(every `create_`/`update_`/`delete_`/`archive_`) are verified statically only.
-Static analysis is strong here — it checks the document, the variables, and the
-response handling — but it cannot prove Jobber accepts the write, and it cannot
-catch permission scopes, business-rule rejections, or throttling.
+Every tool has now been executed against live Jobber except the four blocked by
+scopes above and the four read tools with no data to fetch. What remains
+unproven is narrower than before but real: tools were exercised on **one
+account with one shape of data**, so business-rule edge cases (multi-property
+clients, recurring jobs, partial payments) are untested.
 
-Closing that gap means writing real records into a live Jobber account. Options:
-a separate sandbox account, or production with cleanup — noting some Jobber
-objects cannot be hard-deleted, so residue is likely. **This has not been done
-and requires an explicit decision.**
+Cleanup is best-effort by design. Jobber has no delete for clients, jobs,
+quotes, properties or products — the run archives the client (which hides the
+chain beneath it), voids invoices, deletes visits, and hides products. Records
+are tagged `MCPTEST-<timestamp>` so anything left is easy to find.
 
 ---
 
@@ -246,7 +270,12 @@ claude mcp add --transport http jobber https://jobber-mcp.aaronroberts.xyz/mcp \
 
 ## 8. Known gaps
 
-- **No mutation has been executed.** See §5. This is the largest remaining gap.
+- **Expense and tax writes are blocked by OAuth scope.** See §5.
+- **Push does not auto-deploy.** The Coolify app uses a *public repository*
+  source, which installs no GitHub webhook (only GitHub App sources do), so
+  deploys must be triggered manually. Fix by adding a GitHub webhook pointing at
+  Coolify's manual endpoint, or by granting the existing GitHub App access to
+  this repo and switching the source.
 - **No read-only mode.** `readOnlyHint` is derived from the tool name prefix and
   is advisory. Filter `allTools` behind a `JOBBER_MCP_READ_ONLY` flag if most of
   the team should not be able to write.

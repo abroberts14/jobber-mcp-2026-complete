@@ -211,20 +211,29 @@ if (!dryRun) {
       const e = created.find((c) => c.id === ctx.expenseId); if (e) e.cleanup = 'deleted';
     } catch (e) { console.log(`could not delete expense: ${e.message.slice(0, 120)}`); }
   }
-  if (ctx.jobId) {
-    try { await call('close_job', { jobId: ctx.jobId }); console.log('closed job'); } catch {}
-  }
-  if (ctx.requestId) {
-    try { await call('archive_request', { requestId: ctx.requestId }); console.log('archived request');
-      const r = created.find((c) => c.id === ctx.requestId); if (r) r.cleanup = 'archived';
-    } catch {}
-  }
-  // Visits are genuinely deletable, unlike most of the chain.
+  // Delete visits BEFORE closing jobs: close_job's default
+  // COMPLETE_PAST_DESTROY_FUTURE already destroys future-dated visits, after
+  // which delete_visits fails with "Visit does not exist".
   const visitIds = created.filter((c) => c.kind === 'visit').map((c) => c.id).filter(Boolean);
   if (visitIds.length) {
     try { await call('delete_visits', { visitIds }); console.log(`deleted ${visitIds.length} visit(s)`);
       for (const c of created) if (c.kind === 'visit') c.cleanup = 'deleted';
     } catch (e) { console.log(`could not delete visits: ${e.message.slice(0, 120)}`); }
+  }
+  // Close EVERY job created, not just the first: convert_quote_to_job makes a
+  // second one, and any open job blocks archiving the client.
+  for (const j of created.filter((c) => c.kind === 'job')) {
+    try { await call('close_job', { jobId: j.id }); j.cleanup = 'closed'; } catch {}
+  }
+  if (created.some((c) => c.kind === 'job')) console.log('closed jobs');
+  if (ctx.requestId) {
+    try { await call('archive_request', { requestId: ctx.requestId }); console.log('archived request');
+      const r = created.find((c) => c.id === ctx.requestId); if (r) r.cleanup = 'archived';
+    } catch {}
+  }
+  // Products cannot be deleted; hiding is the closest thing available.
+  for (const p of created.filter((c) => c.kind === 'product')) {
+    try { await call('update_product', { productId: p.id, visible: false }); p.cleanup = 'hidden'; } catch {}
   }
   if (ctx.clientId) {
     // Archiving the client is the strongest removal Jobber offers and hides

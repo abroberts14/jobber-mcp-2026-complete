@@ -94,16 +94,22 @@ rotation disabled, ordinary refreshes should not consume the token. The most
 plausible trigger is two containers overlapping during a rolling deploy that
 coincided with access-token expiry.
 
-Recovery, in this order (the order matters):
+Recovery:
 
 ```bash
-npm run authorize                      # 1. interactive; prints a new refresh token
+npm run authorize                      # interactive; prints a new refresh token
 ```
-2. Update `JOBBER_REFRESH_TOKEN` in Coolify.
-3. **Delete `/data/tokens.json` on the volume.** `hydrateFromStore` prefers the
-   stored token over the env value, so a stale store silently re-adopts the
-   dead token and the redeploy changes nothing.
-4. Redeploy, then call any tool to confirm a clean refresh.
+Then update `JOBBER_REFRESH_TOKEN` in Coolify and redeploy. That is all.
+
+Deleting `/data/tokens.json` used to be a required third step, because
+`hydrateFromStore` prefers the stored token over the environment and a stale
+store silently re-adopted the dead one. The client now retries once with the
+bootstrap token from the environment when the stored token is rejected, so it
+heals itself on the next tool call and the caller sees nothing.
+
+Verified by poisoning the store with a bogus refresh token plus an expired
+access token: the next call fell back, succeeded, rewrote the store with a
+valid pair, and returned normal data.
 
 If you need to hit Jobber directly from a script, take the **access** token from
 the deployed container and never the refresh token — that is exactly what

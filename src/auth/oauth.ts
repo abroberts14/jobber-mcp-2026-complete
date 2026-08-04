@@ -68,8 +68,19 @@ export async function refreshTokens(options: {
     refresh_token: options.refreshToken,
   });
 
-  // Rotation is enabled on some apps and not others. When Jobber omits a new
-  // refresh token, the one we sent is still valid.
+  // Reusing the token we sent is a GUESS, and a dangerous one: Jobber's
+  // refresh tokens are single-use, so if it did rotate and simply didn't tell
+  // us, the token we keep is already spent and the NEXT refresh fails with
+  // "The provided refresh token is not valid" — an hour later, far from the
+  // cause. Warn loudly so this shows up in logs before it bites.
+  if (!tokens.refreshToken) {
+    console.error(
+      '[jobber-auth] WARNING: refresh response contained no refresh_token. ' +
+        'Reusing the previous one, which will fail if Jobber rotated it ' +
+        'server-side. If refreshes start failing, re-run `npm run authorize`.'
+    );
+  }
+
   return { ...tokens, refreshToken: tokens.refreshToken || options.refreshToken };
 }
 
@@ -89,8 +100,21 @@ async function requestTokens(
   const body = await response.text();
 
   if (!response.ok) {
+    // A dead refresh token is unrecoverable in-process and needs a human, so
+    // say what to do rather than leaving an opaque 401 in the tool result.
+    const deadToken =
+      params.grant_type === 'refresh_token' &&
+      /refresh token is not valid|invalid_grant/i.test(body);
+
     throw new Error(
-      `Jobber OAuth error (${params.grant_type}): ${response.status} ${response.statusText} — ${body}`
+      `Jobber OAuth error (${params.grant_type}): ${response.status} ${response.statusText} — ${body}` +
+        (deadToken
+          ? '\nThe stored refresh token is dead and cannot be renewed automatically. ' +
+            'Re-run `npm run authorize`, then update JOBBER_REFRESH_TOKEN and clear ' +
+            'the token store (/data/tokens.json on the deployed server). ' +
+            'Common cause: another process (e.g. a local stdio server) refreshed ' +
+            'against the same Jobber app and consumed the single-use token.'
+          : '')
     );
   }
 

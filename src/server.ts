@@ -15,6 +15,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 import { JobberClient } from './clients/jobber.js';
 import { TokenStore } from './auth/token-store.js';
 import { withThrottleReporter, type ThrottleWait, type QueryCost } from './throttle-context.js';
+import { createHelpTool } from './help.js';
 import { jobsTools } from './tools/jobs-tools.js';
 import { clientsTools } from './tools/clients-tools.js';
 import { quotesTools } from './tools/quotes-tools.js';
@@ -36,43 +37,45 @@ import { tasksTools } from './tools/tasks-tools.js';
 import { assessmentsTools } from './tools/assessments-tools.js';
 
 // Combine all tools
-const allTools = {
-  ...jobsTools,
-  ...clientsTools,
-  ...quotesTools,
-  ...invoicesTools,
-  ...schedulingTools,
-  ...teamTools,
-  ...expensesTools,
-  ...productsTools,
-  ...requestsTools,
-  ...reportingTools,
-  ...propertiesTools,
-  ...timesheetsTools,
-  ...lineItemsTools,
-  ...formsTools,
-  ...taxesTools,
-  ...notesTools,
-  ...searchTools,
-  ...tasksTools,
-  ...assessmentsTools,
+/**
+ * Tools grouped by domain. Single source of truth: dispatch, the duplicate
+ * check and the `help` catalog all derive from this, so help cannot drift out
+ * of sync with what is actually exposed.
+ */
+const TOOL_GROUPS: Record<string, Record<string, any>> = {
+  jobs: jobsTools,
+  clients: clientsTools,
+  quotes: quotesTools,
+  invoices: invoicesTools,
+  scheduling: schedulingTools,
+  team: teamTools,
+  expenses: expensesTools,
+  products: productsTools,
+  requests: requestsTools,
+  reporting: reportingTools,
+  properties: propertiesTools,
+  timesheets: timesheetsTools,
+  'line-items': lineItemsTools,
+  forms: formsTools,
+  taxes: taxesTools,
+  notes: notesTools,
+  search: searchTools,
+  tasks: tasksTools,
+  assessments: assessmentsTools,
 };
 
-// `allTools` is built by object spread, so two modules defining the same key
-// would silently drop one tool with no error anywhere. Fail loudly instead.
+/** Which group each tool came from, for `help`. */
+const toolGroup = new Map<string, string>();
+
+// Object spread means two modules defining the same key would silently drop one
+// tool with no error anywhere. Fail loudly on collision instead.
 {
-  const seen = new Map<string, string>();
   const collisions: string[] = [];
-  for (const [group, tools] of Object.entries({
-    jobsTools, clientsTools, quotesTools, invoicesTools, schedulingTools,
-    teamTools, expensesTools, productsTools, requestsTools, reportingTools,
-    propertiesTools, timesheetsTools, lineItemsTools, formsTools, taxesTools,
-    notesTools, searchTools, tasksTools, assessmentsTools,
-  })) {
+  for (const [group, tools] of Object.entries(TOOL_GROUPS)) {
     for (const name of Object.keys(tools)) {
-      const prior = seen.get(name);
+      const prior = toolGroup.get(name);
       if (prior) collisions.push(`${name} (${prior} and ${group})`);
-      else seen.set(name, group);
+      else toolGroup.set(name, group);
     }
   }
   if (collisions.length) {
@@ -82,7 +85,19 @@ const allTools = {
 
 // Derive readOnlyHint from tool name
 const isReadOnly = (name: string) =>
-  name.startsWith('list_') || name.startsWith('get_') || name.startsWith('search_');
+  name === 'help' ||
+  name.startsWith('list_') ||
+  name.startsWith('get_') ||
+  name.startsWith('search_');
+
+const allTools: Record<string, any> = Object.assign(
+  {},
+  ...Object.values(TOOL_GROUPS),
+  // Built from TOOL_GROUPS above, so the catalog always matches what is
+  // exposed. Deliberately not a src/tools/ module: it issues no GraphQL, and
+  // the query validators would flag it for that.
+  createHelpTool(TOOL_GROUPS, isReadOnly)
+);
 
 /**
  * Tool schemas are authored as Zod but MCP requires JSON Schema on the wire.

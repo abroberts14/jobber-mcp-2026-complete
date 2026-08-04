@@ -126,23 +126,47 @@ for (const tool of readTools) {
   if (data) harvest(tool.name, data);
 }
 
+/**
+ * Only *Id/*Ids arguments need a harvested ID. Everything else is filled from
+ * the tool's JSON Schema by type and name — otherwise date-ranged tools like
+ * the reports get skipped for want of a `startDate` that was never an ID.
+ */
+function valueForArg(key, schema) {
+  const prop = schema?.properties?.[key] ?? {};
+  if (Array.isArray(prop.enum) && prop.enum.length) return prop.enum[0];
+  if (prop.type === 'number' || prop.type === 'integer') return 1;
+  if (prop.type === 'boolean') return false;
+  if (/(date|At|start|end|after|before)$/i.test(key)) {
+    return /^end|before/i.test(key)
+      ? new Date().toISOString()
+      : new Date(Date.now() - 90 * 864e5).toISOString();
+  }
+  if (/timezone/i.test(key)) return 'UTC';
+  if (/(query|search|term)/i.test(key)) return 'a';
+  return 'sample';
+}
+
 // Pass 2 — replay harvested IDs into tools that require one.
 console.log('\n--- pass 2: reads needing an ID ---');
 for (const tool of deferred) {
   const req = requiredOf(tool);
   const args = { limit: 2 };
-  let satisfied = true;
+  const missing = [];
   for (const key of req) {
-    const entity = key.replace(/Id$/, '').toLowerCase();
-    const found =
-      harvested.get(entity) ??
-      harvested.get(entity.replace(/y$/, 'ie')) ??
-      harvested.get(`${entity}e`);
-    if (found) args[key] = found;
-    else satisfied = false;
+    if (/Ids?$/.test(key)) {
+      const entity = key.replace(/Ids?$/, '').toLowerCase();
+      const found =
+        harvested.get(entity) ??
+        harvested.get(entity.replace(/y$/, 'ie')) ??
+        harvested.get(`${entity}e`);
+      if (found) args[key] = key.endsWith('Ids') ? [found] : found;
+      else missing.push(key);
+    } else {
+      args[key] = valueForArg(key, tool.inputSchema);
+    }
   }
-  if (!satisfied) {
-    console.log(`skip  ${tool.name}  (no ${req.join(', ')} discovered)`);
+  if (missing.length) {
+    console.log(`skip  ${tool.name}  (no live ${missing.join(', ')} in this account)`);
     continue;
   }
   await run(tool, args);

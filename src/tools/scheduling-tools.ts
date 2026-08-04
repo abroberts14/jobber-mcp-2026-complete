@@ -296,4 +296,101 @@ export const schedulingTools = {
       return { assignedUsers: data.visit?.assignedUsers?.nodes ?? [] };
     },
   },
+
+  uncomplete_visit: {
+    description: 'Mark a completed visit as not complete',
+    inputSchema: z.object({
+      visitId: z.string(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation UncompleteVisit($visitId: EncodedId!) {
+          visitUncomplete(visitId: $visitId) {
+            visit {
+              ${JobberClient.visitFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, { visitId: args.visitId });
+
+      if (data.visitUncomplete.userErrors?.length > 0) {
+        throw new Error(
+          `Visit uncomplete failed: ${data.visitUncomplete.userErrors.map((e: any) => e.message).join(', ')}`
+        );
+      }
+
+      return { visit: data.visitUncomplete.visit };
+    },
+  },
+
+  delete_visits: {
+    description:
+      'Delete one or more visits. Takes a list because Jobber deletes visits in batches (visitDelete accepts visitIds).',
+    inputSchema: z.object({
+      visitIds: z.array(z.string()).min(1),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation DeleteVisits($visitIds: [EncodedId!]!) {
+          visitDelete(visitIds: $visitIds) {
+            visits {
+              id
+              title
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, { visitIds: args.visitIds });
+
+      if (data.visitDelete.userErrors?.length > 0) {
+        throw new Error(`Visit delete failed: ${data.visitDelete.userErrors.map((e: any) => e.message).join(', ')}`);
+      }
+
+      return { deletedVisits: data.visitDelete.visits ?? [] };
+    },
+  },
+
+  assign_visit_users: {
+    description:
+      'Set the team members assigned to a visit. This replaces the full assignment list rather than adding to it.',
+    inputSchema: z.object({
+      visitId: z.string(),
+      assignedUserIds: z.array(z.string()).describe('Full replacement list; pass [] to unassign everyone'),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation AssignVisitUsers($visitId: EncodedId!, $input: VisitEditAssignedUsersInput!) {
+          visitEditAssignedUsers(visitId: $visitId, input: $input) {
+            visit {
+              ${JobberClient.visitFields}
+              assignedUsers {
+                nodes {
+                  ${JobberClient.userFields}
+                }
+              }
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, {
+        visitId: args.visitId,
+        input: { assignedUserIds: args.assignedUserIds },
+      });
+
+      if (data.visitEditAssignedUsers.userErrors?.length > 0) {
+        throw new Error(
+          `Visit assignment failed: ${data.visitEditAssignedUsers.userErrors.map((e: any) => e.message).join(', ')}`
+        );
+      }
+
+      return { visit: data.visitEditAssignedUsers.visit };
+    },
+  },
 };

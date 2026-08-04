@@ -220,6 +220,43 @@ export const productsTools = {
     },
   },
 
+  search_products: {
+    description: 'Search products and services by name or description',
+    inputSchema: z.object({
+      query: z.string().describe('Search term'),
+      limit: z.number().default(50),
+      cursor: z.string().optional(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      // Deliberately uses `products(searchTerm:)` rather than the dedicated
+      // `productsSearch` query. The latter is in the schema but its resolver
+      // returns HTTP 500 for every input, including the most minimal
+      // selection — a Jobber-side fault, not a malformed query. `products`
+      // takes the same searchTerm and works.
+      const query = `
+        query SearchProducts($searchTerm: String, $first: Int, $after: String) {
+          products(searchTerm: $searchTerm, first: $first, after: $after) {
+            nodes {
+              ${PRODUCT_FIELDS}
+            }
+            ${PAGE_INFO}
+          }
+        }
+      `;
+
+      const data = await client.query(query, {
+        searchTerm: args.query,
+        first: args.limit,
+        after: args.cursor,
+      });
+      return {
+        products: data.products?.nodes ?? [],
+        pageInfo: data.products?.pageInfo,
+        totalCount: data.products?.totalCount,
+      };
+    },
+  },
+
   // NOTE: `delete_product` was removed. It previously called a nonexistent
   // `productArchive` mutation. The only product/service mutations in the
   // schema are `productsAndServicesCreate` and `productsAndServicesEdit` —

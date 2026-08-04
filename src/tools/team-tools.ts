@@ -177,4 +177,39 @@ export const teamTools = {
       };
     },
   },
+
+  update_user: {
+    description:
+      "Update a team member. Jobber's UserEditInput exposes only the display name — role, status and permissions are not editable through the public API.",
+    inputSchema: z.object({
+      userId: z.string(),
+      name: z.string().describe('Display name'),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation UpdateUser($userId: EncodedId!, $input: UserEditInput!) {
+          userEdit(userId: $userId, input: $input) {
+            user {
+              ${JobberClient.userFields}
+            }
+            userErrors {
+              message
+              path
+            }
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, {
+        userId: args.userId,
+        input: { name: args.name },
+      });
+
+      if (data.userEdit.userErrors?.length > 0) {
+        throw new Error(`User update failed: ${data.userEdit.userErrors.map((e: any) => e.message).join(', ')}`);
+      }
+
+      return { user: data.userEdit.user };
+    },
+  },
 };

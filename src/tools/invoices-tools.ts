@@ -234,4 +234,273 @@ export const invoicesTools = {
       };
     },
   },
+
+  update_invoice: {
+    description: 'Update an existing invoice',
+    inputSchema: z.object({
+      invoiceId: z.string(),
+      subject: z.string().optional(),
+      message: z.string().optional(),
+      invoiceNumber: z.string().optional(),
+      issuedDate: z.string().optional().describe('ISO 8601 datetime'),
+      propertyId: z.string().optional(),
+      taxRateId: z.string().optional(),
+      salespersonId: z.string().optional(),
+      allowPartialPayments: z.boolean().optional(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation UpdateInvoice($invoiceId: EncodedId!, $input: InvoiceEditInput!) {
+          invoiceEdit(invoiceId: $invoiceId, input: $input) {
+            invoice {
+              ${JobberClient.invoiceFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const input: Record<string, unknown> = {};
+      for (const key of [
+        'subject', 'message', 'invoiceNumber', 'issuedDate',
+        'propertyId', 'taxRateId', 'salespersonId', 'allowPartialPayments',
+      ]) {
+        if (args[key] !== undefined) input[key] = args[key];
+      }
+
+      const data = await client.mutate(mutation, { invoiceId: args.invoiceId, input });
+
+      if (data.invoiceEdit.userErrors?.length > 0) {
+        throw new Error(`Invoice update failed: ${data.invoiceEdit.userErrors.map((e: any) => e.message).join(', ')}`);
+      }
+
+      return { invoice: data.invoiceEdit.invoice };
+    },
+  },
+
+  void_invoice: {
+    description:
+      'Void an invoice. Voiding is the only way to retire an invoice — Jobber has no invoice-delete mutation — and an open invoice will block archiving its client.',
+    inputSchema: z.object({
+      invoiceId: z.string(),
+      voidReasonCode: z
+        .enum(['DUPLICATE_INVOICE', 'CREATED_IN_ERROR', 'CLIENT_REQUEST', 'OTHER'])
+        .default('CREATED_IN_ERROR'),
+      voidReasonDetails: z.string().optional(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation VoidInvoice($id: EncodedId!, $input: InvoiceVoidInput!) {
+          invoiceVoid(id: $id, input: $input) {
+            invoice {
+              ${JobberClient.invoiceFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const input: Record<string, unknown> = { voidReasonCode: args.voidReasonCode };
+      if (args.voidReasonDetails) input.voidReasonDetails = args.voidReasonDetails;
+
+      const data = await client.mutate(mutation, { id: args.invoiceId, input });
+
+      if (data.invoiceVoid.userErrors?.length > 0) {
+        throw new Error(`Invoice void failed: ${data.invoiceVoid.userErrors.map((e: any) => e.message).join(', ')}`);
+      }
+
+      return { invoice: data.invoiceVoid.invoice };
+    },
+  },
+
+  close_invoice: {
+    description:
+      'Close an invoice, either by marking the balance received or writing it off as bad debt.',
+    inputSchema: z.object({
+      invoiceId: z.string(),
+      closeOption: z.enum(['MARK_RECEIVED', 'BAD_DEBT']).default('MARK_RECEIVED'),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation CloseInvoice($id: EncodedId!, $input: InvoiceCloseInput!) {
+          invoiceClose(id: $id, input: $input) {
+            invoice {
+              ${JobberClient.invoiceFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, {
+        id: args.invoiceId,
+        input: { closeOption: args.closeOption },
+      });
+
+      if (data.invoiceClose.userErrors?.length > 0) {
+        throw new Error(`Invoice close failed: ${data.invoiceClose.userErrors.map((e: any) => e.message).join(', ')}`);
+      }
+
+      return { invoice: data.invoiceClose.invoice };
+    },
+  },
+
+  reopen_invoice: {
+    description: 'Reopen a closed invoice',
+    inputSchema: z.object({
+      invoiceId: z.string(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation ReopenInvoice($id: EncodedId!) {
+          invoiceReopen(id: $id) {
+            invoice {
+              ${JobberClient.invoiceFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, { id: args.invoiceId });
+
+      if (data.invoiceReopen.userErrors?.length > 0) {
+        throw new Error(`Invoice reopen failed: ${data.invoiceReopen.userErrors.map((e: any) => e.message).join(', ')}`);
+      }
+
+      return { invoice: data.invoiceReopen.invoice };
+    },
+  },
+
+  unmark_invoice_bad_debt: {
+    description: 'Reverse a bad-debt write-off, returning the invoice to its prior state',
+    inputSchema: z.object({
+      invoiceId: z.string(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation UnmarkBadDebt($id: EncodedId!) {
+          invoiceUnmarkBadDebt(id: $id) {
+            invoice {
+              ${JobberClient.invoiceFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, { id: args.invoiceId });
+
+      if (data.invoiceUnmarkBadDebt.userErrors?.length > 0) {
+        throw new Error(
+          `Unmark bad debt failed: ${data.invoiceUnmarkBadDebt.userErrors.map((e: any) => e.message).join(', ')}`
+        );
+      }
+
+      return { invoice: data.invoiceUnmarkBadDebt.invoice };
+    },
+  },
+
+  list_payments: {
+    description:
+      'List payment records across the account. Read-only: Jobber exposes no mutation for recording a payment.',
+    inputSchema: z.object({
+      clientId: z.string().optional(),
+      paymentType: z
+        .enum([
+          'CASH', 'CHEQUE', 'CREDIT_CARD', 'BANK_TRANSFER', 'MONEY_ORDER', 'OTHER',
+          'ZELLE', 'CASH_APP', 'PAYPAL', 'VENMO', 'E_TRANSFER', 'ACH_BANK_PAYMENT',
+          'JOBBER_PAYMENTS', 'EPAYMENT', 'CONSUMER_FINANCING',
+        ])
+        .optional(),
+      entryDateAfter: z.string().optional().describe('ISO 8601 datetime'),
+      entryDateBefore: z.string().optional().describe('ISO 8601 datetime'),
+      limit: z.number().default(50),
+      cursor: z.string().optional(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const query = `
+        query ListPayments($first: Int, $after: String, $filter: PaymentRecordFilterAttributes) {
+          paymentRecords(first: $first, after: $after, filter: $filter) {
+            nodes {
+              id
+              amount
+              rawAmount
+              entryDate
+              adjustmentType
+              paymentType
+              details
+              sentAt
+              client {
+                id
+                name
+              }
+              invoice {
+                id
+                invoiceNumber
+              }
+            }
+            ${PAGE_INFO}
+          }
+        }
+      `;
+
+      const filter: Record<string, unknown> = {};
+      if (args.clientId) filter.clientId = args.clientId;
+      if (args.paymentType) filter.paymentType = args.paymentType;
+      if (args.entryDateAfter || args.entryDateBefore) {
+        filter.entryDate = {
+          ...(args.entryDateAfter ? { after: args.entryDateAfter } : {}),
+          ...(args.entryDateBefore ? { before: args.entryDateBefore } : {}),
+        };
+      }
+
+      const data = await client.query(query, {
+        first: args.limit,
+        after: args.cursor,
+        filter,
+      });
+      return {
+        payments: data.paymentRecords?.nodes ?? [],
+        pageInfo: data.paymentRecords?.pageInfo,
+        totalCount: data.paymentRecords?.totalCount,
+      };
+    },
+  },
+
+  get_payment: {
+    description: 'Get a specific payment record by ID',
+    inputSchema: z.object({
+      paymentId: z.string(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const query = `
+        query GetPayment($id: EncodedId!) {
+          paymentRecord(id: $id) {
+            id
+            amount
+            rawAmount
+            entryDate
+            adjustmentType
+            paymentType
+            paymentOrigin
+            details
+            sentAt
+            canEdit
+            client {
+              id
+              name
+            }
+            invoice {
+              id
+              invoiceNumber
+            }
+          }
+        }
+      `;
+
+      const data = await client.query(query, { id: args.paymentId });
+      return { payment: data.paymentRecord };
+    },
+  },
 };

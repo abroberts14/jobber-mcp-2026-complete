@@ -284,4 +284,33 @@ export const clientsTools = {
       };
     },
   },
+
+  unarchive_client: {
+    description: 'Restore a previously archived client',
+    inputSchema: z.object({
+      clientId: z.string(),
+    }),
+    execute: async (client: JobberClient, args: any) => {
+      const mutation = `
+        mutation UnarchiveClient($clientId: EncodedId!) {
+          clientUnarchive(clientId: $clientId) {
+            client {
+              ${JobberClient.clientFields}
+            }
+            ${USER_ERRORS}
+          }
+        }
+      `;
+
+      const data = await client.mutate(mutation, { clientId: args.clientId });
+
+      if (data.clientUnarchive.userErrors?.length > 0) {
+        throw new Error(
+          `Client unarchive failed: ${data.clientUnarchive.userErrors.map((e: any) => e.message).join(', ')}`
+        );
+      }
+
+      return { client: data.clientUnarchive.client };
+    },
+  },
 };

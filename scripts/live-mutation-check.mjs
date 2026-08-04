@@ -117,6 +117,13 @@ await step('delete_line_items', () => ({
   parent: 'job', parentId: ctx.jobId, lineItemIds: [ctx.jobLineItems?.[1]],
 }));
 
+// Needed by phase 3 (visit assignment) as well as phase 5.
+try {
+  const users = await call('list_users', { limit: 1 });
+  ctx.userId = firstId(users);
+  ctx.userName = users?.users?.[0]?.name?.full ?? users?.users?.[0]?.name;
+} catch { /* surfaced by the steps that need it */ }
+
 console.log('\n=== phase 3: visits ===');
 const start = new Date(Date.now() + 7 * 864e5).toISOString();
 await step('create_visit', () => ({
@@ -126,6 +133,10 @@ await step('create_visit', () => ({
 }), (o) => { ctx.visitId = firstId(o); created.push({ kind: 'visit', id: ctx.visitId }); });
 await step('update_visit', () => ({ visitId: ctx.visitId, title: `${TAG} visit edited` }));
 await step('complete_visit', () => ({ visitId: ctx.visitId }));
+await step('uncomplete_visit', () => ({ visitId: ctx.visitId }));
+await step('assign_visit_users', () => ({
+  visitId: ctx.visitId, assignedUserIds: ctx.userId ? [ctx.userId] : [],
+}));
 await step('create_job_visit', () => ({
   jobId: ctx.jobId, title: `${TAG} visit2`, startAt: start,
   timezone: 'America/Denver', notifyTeam: false,
@@ -147,10 +158,6 @@ console.log('\n=== phase 5: requests ===');
 await step('create_request', () => ({ clientId: ctx.clientId, title: `${TAG} request` }),
   (o) => { ctx.requestId = firstId(o); created.push({ kind: 'request', id: ctx.requestId }); });
 await step('update_request', () => ({ requestId: ctx.requestId, title: `${TAG} request edited` }));
-try {
-  const users = await call('list_users', { limit: 1 });
-  ctx.userId = firstId(users);
-} catch { /* reported by the step below */ }
 await step('assign_request', () => ({ requestId: ctx.requestId, userId: ctx.userId }));
 await step('archive_request', () => ({ requestId: ctx.requestId }));
 await step('unarchive_request', () => ({ requestId: ctx.requestId }));
@@ -173,11 +180,28 @@ await step('create_tax_group', () => ({
 await step('create_invoice', () => ({
   clientId: ctx.clientId, subject: `${TAG} invoice`, lineItems: [LINE_ITEM('i')],
 }), (o) => { ctx.invoiceId = firstId(o); created.push({ kind: 'invoice', id: ctx.invoiceId }); });
+await step('update_invoice', () => ({ invoiceId: ctx.invoiceId, message: 'updated by test' }));
 await step('send_invoice', () => ({ invoiceId: ctx.invoiceId }));
+await step('close_invoice', () => ({ invoiceId: ctx.invoiceId, closeOption: 'MARK_RECEIVED' }));
+await step('reopen_invoice', () => ({ invoiceId: ctx.invoiceId }));
+await step('close_invoice', () => ({ invoiceId: ctx.invoiceId, closeOption: 'BAD_DEBT' }));
+await step('unmark_invoice_bad_debt', () => ({ invoiceId: ctx.invoiceId }));
+// Void last: an open invoice blocks archiving the client in cleanup.
+await step('void_invoice', () => ({
+  invoiceId: ctx.invoiceId, voidReasonCode: 'CREATED_IN_ERROR',
+  voidReasonDetails: 'automated tool verification',
+}), () => { const inv = created.find((c) => c.id === ctx.invoiceId); if (inv) inv.cleanup = 'voided'; });
 
-console.log('\n=== phase 8: job lifecycle ===');
+console.log('\n=== phase 8: job + team lifecycle ===');
 await step('close_job', () => ({ jobId: ctx.jobId }));
 await step('reopen_job', () => ({ jobId: ctx.jobId }));
+// Write the user's existing name back: exercises the mutation without
+// actually renaming a real team member.
+if (ctx.userId && ctx.userName) {
+  await step('update_user', () => ({ userId: ctx.userId, name: ctx.userName }));
+} else {
+  console.log('skip  update_user  (no user/name discovered)');
+}
 
 console.log('\n=== cleanup ===');
 if (!dryRun) {
@@ -195,12 +219,24 @@ if (!dryRun) {
       const r = created.find((c) => c.id === ctx.requestId); if (r) r.cleanup = 'archived';
     } catch {}
   }
+  // Visits are genuinely deletable, unlike most of the chain.
+  const visitIds = created.filter((c) => c.kind === 'visit').map((c) => c.id).filter(Boolean);
+  if (visitIds.length) {
+    try { await call('delete_visits', { visitIds }); console.log(`deleted ${visitIds.length} visit(s)`);
+      for (const c of created) if (c.kind === 'visit') c.cleanup = 'deleted';
+    } catch (e) { console.log(`could not delete visits: ${e.message.slice(0, 120)}`); }
+  }
   if (ctx.clientId) {
     // Archiving the client is the strongest removal Jobber offers and hides
-    // the whole chain hanging off it.
-    try { await call('archive_client', { clientId: ctx.clientId }); console.log('archived client');
+    // the whole chain hanging off it. Round-trip through unarchive so that
+    // mutation is exercised too, then leave the client archived.
+    try {
+      await call('archive_client', { clientId: ctx.clientId }); console.log('archived client');
+      await call('unarchive_client', { clientId: ctx.clientId }); console.log('unarchived client (round-trip)');
+      pass.push('unarchive_client');
+      await call('archive_client', { clientId: ctx.clientId }); console.log('re-archived client');
       const c = created.find((x) => x.id === ctx.clientId); if (c) c.cleanup = 'archived';
-    } catch (e) { console.log(`could not archive client: ${e.message.slice(0, 120)}`); }
+    } catch (e) { console.log(`client archive round-trip failed: ${e.message.slice(0, 160)}`); }
   }
 }
 
